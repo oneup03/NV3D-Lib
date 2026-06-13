@@ -16,6 +16,9 @@ NV3DLib/lib/
 [Bb]uild/
 [Ll]og/
 
+# Local SDK packaging output (tools/package_*.ps1)
+out/
+
 # Build artifacts at any depth
 *.obj
 *.lib
@@ -54,7 +57,8 @@ ipch/
 # =============================================================================
 # IDE / OS noise
 # =============================================================================
-.vscode/
+.vscode/*
+!.vscode/tasks.json
 .idea/
 *.swp
 *~

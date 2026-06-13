@@ -1,0 +1,94 @@
+{
+    "version": "2.0.0",
+    "type": "shell",
+    "options": {
+        "cwd": "${workspaceFolder}",
+        "shell": {
+            "executable": "powershell.exe",
+            "args": [ "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command" ]
+        }
+    },
+    "presentation": {
+        "echo": true,
+        "reveal": "always",
+        "focus": false,
+        "panel": "shared",
+        "clear": false
+    },
+    "problemMatcher": [ "$msCompile" ],
+    "tasks": [
+        {
+            "label": "Build NV3DLib (Release-MD x64)",
+            "detail": "Default build: NV3DLib only, Release-MD x64.",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MD -Platform x64 -Target NV3DLib",
+            "group": { "kind": "build", "isDefault": true }
+        },
+        {
+            "label": "Build NV3DLib (Release-MD x86)",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MD -Platform x86 -Target NV3DLib",
+            "group": "build"
+        },
+        {
+            "label": "Build NV3DLib (Release-MT x64)",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MT -Platform x64 -Target NV3DLib",
+            "group": "build"
+        },
+        {
+            "label": "Build NV3DLib (Release-MT x86)",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MT -Platform x86 -Target NV3DLib",
+            "group": "build"
+        },
+        {
+            "label": "Build NV3DLib (all 4 Release configs)",
+            "detail": "Sequentially builds Release-MT/Release-MD x86/x64 — the set the SDK zip ships.",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build NV3DLib (Release-MD x64)",
+                "Build NV3DLib (Release-MD x86)",
+                "Build NV3DLib (Release-MT x64)",
+                "Build NV3DLib (Release-MT x86)"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "Build samples (Release-MD x64)",
+            "detail": "Builds DX11/DX12/OGL/Vulkan sample exes — the set the Samples zip ships.",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MD -Platform x64",
+            "group": "build"
+        },
+        {
+            "label": "Package SDK zip",
+            "detail": "Requires 'Build NV3DLib (all 4 Release configs)' to have run first.",
+            "command": ".\\tools\\package_sdk.ps1 -Version local",
+            "group": "build"
+        },
+        {
+            "label": "Package Samples zip",
+            "detail": "Requires 'Build samples (Release-MD x64)' to have run first.",
+            "command": ".\\tools\\package_samples.ps1 -Version local",
+            "group": "build"
+        },
+        {
+            "label": "Release: build everything + package both zips",
+            "detail": "End-to-end local release build: 4 lib configs + samples + both zips into ./out/.",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build NV3DLib (all 4 Release configs)",
+                "Build samples (Release-MD x64)",
+                "Package SDK zip",
+                "Package Samples zip"
+            ],
+            "group": "build"
+        },
+        {
+            "label": "Clean (Release-MD x64)",
+            "command": ".\\tools\\build.ps1 -Configuration Release-MD -Platform x64 -Clean",
+            "group": "build"
+        },
+        {
+            "label": "Clean all (Release configs + out/)",
+            "command": "Remove-Item -Recurse -Force out, NV3DLib\\lib, bin\\samples -ErrorAction SilentlyContinue; .\\tools\\build.ps1 -Configuration Release-MD -Platform x64 -Clean",
+            "group": "build"
+        }
+    ]
+}

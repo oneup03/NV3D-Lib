@@ -1,0 +1,82 @@
+name: Release (rolling latest)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create / update the 'latest' GitHub Release
+
+concurrency:
+  group: release-latest
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      # NV3DLib library — all 4 Release configs (x86/x64 x MT/MD). The
+      # solution-level platform names are "x86" / "x64"; the .sln maps them
+      # to the project-level "Win32" / "x64" automatically.
+      - name: Build NV3DLib Release-MD x64
+        run: msbuild NV3DLib.sln /t:NV3DLib /p:Configuration=Release-MD /p:Platform=x64 /m /nologo /v:minimal
+
+      - name: Build NV3DLib Release-MD x86
+        run: msbuild NV3DLib.sln /t:NV3DLib /p:Configuration=Release-MD /p:Platform=x86 /m /nologo /v:minimal
+
+      - name: Build NV3DLib Release-MT x64
+        run: msbuild NV3DLib.sln /t:NV3DLib /p:Configuration=Release-MT /p:Platform=x64 /m /nologo /v:minimal
+
+      - name: Build NV3DLib Release-MT x86
+        run: msbuild NV3DLib.sln /t:NV3DLib /p:Configuration=Release-MT /p:Platform=x86 /m /nologo /v:minimal
+
+      # Sample exes for the Samples zip (x64 Release-MD only). The samples
+      # depend on the NV3DLib project, so they pick up the Release-MD x64
+      # lib built above.
+      # Quote the semicolon-separated target list so PowerShell doesn't
+      # treat the ';' as statement separators.
+      - name: Build samples Release-MD x64
+        run: msbuild NV3DLib.sln '/t:DX11Sample;DX12Sample;OGLSample;VulkanSample' /p:Configuration=Release-MD /p:Platform=x64 /m /nologo /v:minimal
+
+      - name: Package SDK + Samples zips
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          .\tools\package_sdk.ps1 -Version $sha
+          .\tools\package_samples.ps1 -Version $sha
+          Get-ChildItem out
+
+      - name: Update rolling 'latest' pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest build (main)"
+          prerelease: true
+          target_commitish: ${{ github.sha }}
+          body: |
+            Rolling continuous build of `main`.
+
+            **Commit:** ${{ github.sha }}
+            **Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ## Assets
+            - `NV3DLib-SDK.zip` — header + 4 static libs (x86/x64 x Release-MT/Release-MD) + bundled NVAPI headers/libs. Drop into your project and link.
+            - `NV3DLib-Samples.zip` — prebuilt x64 sample exes (DX11/DX12/OGL/Vulkan) for quick "does 3D Vision work on this rig?" testing.
+
+            See [README](https://github.com/${{ github.repository }}/blob/main/README.md) for integration details.
+          files: |
+            out/NV3DLib-SDK.zip
+            out/NV3DLib-Samples.zip
+          fail_on_unmatched_files: true
