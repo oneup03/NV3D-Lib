@@ -122,7 +122,24 @@ void PresentWindow::WindowThreadLoop() {
     }
 
     InstallSubclass(hwnd_);
+
+    // Make the FSE window transparent to mouse input (click-through) so the
+    // user can still interact with the underlying game window. WS_EX_LAYERED
+    // is required for WS_EX_TRANSPARENT to take effect on a top-level window;
+    // SetLayeredWindowAttributes with alpha=255 keeps it fully opaque.
+    LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT);
+    SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+
     window_ready_.store(true);
+
+    // Follow the host's foreground state. WS_EX_TRANSPARENT means we never
+    // become the active window, so WM_ACTIVATE/WM_ACTIVATEAPP can't tell us
+    // when the user alt+tabs out of the game — we poll instead. Comparing
+    // process IDs (not HWNDs) handles game-spawned dialogs, in-process
+    // overlays, secondary game windows, etc. as "still the game".
+    const DWORD self_pid = GetCurrentProcessId();
+    DWORD last_fg_check_ms = 0;
 
     MSG msg;
     while (!window_stop_.load()) {
@@ -131,6 +148,20 @@ void PresentWindow::WindowThreadLoop() {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         } else {
+            const DWORD now_ms = GetTickCount();
+            if (now_ms - last_fg_check_ms >= 100 && !window_stop_.load()) {
+                last_fg_check_ms = now_ms;
+                HWND fg = GetForegroundWindow();
+                DWORD fg_pid = 0;
+                if (fg) GetWindowThreadProcessId(fg, &fg_pid);
+                const bool host_focused = (fg_pid == self_pid);
+                const bool iconic = IsIconic(hwnd_) != FALSE;
+                if (host_focused && iconic) {
+                    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+                } else if (!host_focused && !iconic) {
+                    ShowWindow(hwnd_, SW_SHOWMINNOACTIVE);
+                }
+            }
             Sleep(1);
         }
     }
