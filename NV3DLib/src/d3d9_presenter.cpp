@@ -274,6 +274,13 @@ bool D3D9Presenter::BuildD3D9Stack() {
         is_fse_ = true;
         NV3D_LOG_INFO(L"D3D9Presenter: device created (FSE) adapter=%u %ux%u@%uHz",
                        adapter, dm.Width, dm.Height, dm.RefreshRate);
+        // Apply click-through styling AFTER FSE is established. VRto3D's
+        // NvStereoDx9Presenter does this in the same order — applying
+        // WS_EX_TRANSPARENT before CreateDeviceEx makes ForceForeground a
+        // no-op and FSE never engages cleanly, so the first focus shake
+        // pushes the device into a black/occluded state. Doing it after
+        // means FSE is fully engaged when click-through goes on.
+        window_->ApplyClickThrough();
     }
 
     NvAPI_Stereo_Enable();

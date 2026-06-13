@@ -35,12 +35,46 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <windows.h>
 
 namespace NV3D {
+
+namespace detail {
+
+// MSVC-only structured-exception guard around the work function. The
+// reason this exists: when the FSE D3D9Ex popup loses foreground (e.g.
+// the user clicks the host's window), D3D9 / NvAPI / the user-mode
+// driver can fault inside Present-time calls — StretchRect on a back
+// buffer whose state the driver reshuffled, NvAPI_Stereo_SetActiveEye on
+// a stereo handle that no longer maps to an active device, PresentEx on
+// an occluded swap chain that the driver has freed underneath us. These
+// surface as SEH access violations, not C++ exceptions, so a plain
+// catch(...) does not stop them on the MSVC /EHsc default.
+//
+// __except (EXCEPTION_EXECUTE_HANDLER) swallows the AV. The work
+// function's captured ComPtrs leak their refs during SEH unwind because
+// /EHsc does NOT run C++ destructors on structured-exception unwind —
+// that's a slow per-incident leak, not a crash, and it stops the host
+// process going down with the driver fault. The caller's next Submit
+// retries; if the FSE state has recovered presentation resumes, if it
+// hasn't the next attempt just returns E_FAIL the same way.
+inline HRESULT InvokeWithSEH(std::function<HRESULT()>& fn, DWORD* out_code = nullptr) {
+    HRESULT hr = E_FAIL;
+    __try {
+        if (fn) hr = fn();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (out_code) *out_code = GetExceptionCode();
+        hr = E_FAIL;
+    }
+    return hr;
+}
+
+}  // namespace detail
 
 class AsyncPresenter {
 public:
@@ -137,12 +171,18 @@ private:
                 fn = std::move(pending_);
             }
 
-            HRESULT hr = E_FAIL;
-            try {
-                if (fn) hr = fn();
-            }
-            catch (...) {
-                hr = E_UNEXPECTED;
+            // SEH-guarded: a driver-side access violation (typically
+            // triggered by FSE focus loss when the host's window
+            // takes focus from our popup) gets turned into E_FAIL
+            // instead of terminating the host process. See the comment
+            // on detail::InvokeWithSEH for the gory details.
+            DWORD seh_code = 0;
+            HRESULT hr = detail::InvokeWithSEH(fn, &seh_code);
+            if (seh_code != 0) {
+                fwprintf(stderr, L"NV3D AsyncPresenter: SEH caught in worker code=0x%08lX — "
+                                  L"D3D9/NvAPI driver fault, worker continues\n",
+                          static_cast<unsigned long>(seh_code));
+                fflush(stderr);
             }
             last_result_.store(hr);
 

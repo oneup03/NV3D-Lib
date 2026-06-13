@@ -48,6 +48,14 @@ public:
     // When false, the host can minimize / lose focus normally.
     void SetSuppressMinimize(bool suppress);
 
+    // Apply WS_EX_LAYERED + WS_EX_TRANSPARENT to make the popup transparent
+    // to mouse input (clicks fall through to whatever is underneath). MUST
+    // be called AFTER D3D9Ex CreateDeviceEx FSE succeeds — applying it
+    // before makes the window ineligible for activation, so ForceForeground
+    // inside BuildD3D9Stack becomes a no-op and FSE never engages cleanly.
+    // No-op in host-owned mode.
+    void ApplyClickThrough();
+
 private:
     static LRESULT CALLBACK SubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp);
 
