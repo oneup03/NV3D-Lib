@@ -123,10 +123,11 @@ void D3D9Presenter::Shutdown() {
     // ChangeDisplaySettingsExW fallback) can push the original timing.
     lightboost_.Disable();
 
-    // NvAPI_Unload is intentionally NOT called here. NvAPI_Unload disables
-    // NVAPI process-wide, not per-init, so calling it from a library would
-    // break other NVAPI users in the host process. The runtime gets cleaned
-    // up by Windows on process exit.
+    // NvAPI_Unload mirrors VRto3D's teardown step 5. Unconditional — runs
+    // even on the dead-device path (NvAPI cleans up the leaked stereo handle
+    // here). NvAPI is reference-counted process-wide, so this only fully
+    // disables NVAPI when our Initialize was the last live ref.
+    NvAPI_Unload();
 }
 
 bool D3D9Presenter::BuildD3D9Stack() {
