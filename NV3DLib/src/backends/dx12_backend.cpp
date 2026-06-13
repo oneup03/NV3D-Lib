@@ -58,6 +58,11 @@ HRESULT DX12Backend::Init(ID3D12Device* device, ID3D12CommandQueue* queue,
     }
 
     if (params_.enable_suppressor) suppressor_.Install();
+
+    // Spawn the async present worker. From this point on, Present() returns
+    // as soon as the worker has accepted the submission — the EVENT-query
+    // spin + D3D9 PresentEx vsync run on the worker thread, not the host's.
+    async_.Start();
     return S_OK;
 }
 
@@ -326,15 +331,38 @@ HRESULT DX12Backend::Present() {
     if (!presenter_ || presenter_->IsDead()) return E_FAIL;
     if (!input_tex_) return E_NOT_VALID_STATE;
 
-    HRESULT hr = EnsureResourceImport(input_tex_.Get());
+    // Snapshot per-frame state so the host can call SetInputTexture again
+    // (mutating the members) before the worker finishes processing this
+    // frame. ComPtr copies AddRef the underlying interface; the worker
+    // releases the snapshot when the lambda destructs.
+    Microsoft::WRL::ComPtr<ID3D12Resource> snap_tex   = input_tex_;
+    Microsoft::WRL::ComPtr<ID3D12Fence>    snap_fence = input_fence_;
+    const uint64_t  snap_fence_value = input_fence_value_;
+    const uint32_t  snap_w           = input_w_;
+    const uint32_t  snap_h           = input_h_;
+
+    return async_.Submit([this, snap_tex, snap_fence, snap_fence_value,
+                          snap_w, snap_h]() {
+        return PresentSyncBody(snap_tex.Get(), snap_fence.Get(),
+                                snap_fence_value, snap_w, snap_h);
+    });
+}
+
+HRESULT DX12Backend::PresentSyncBody(ID3D12Resource* tex, ID3D12Fence* fence,
+                                       uint64_t fence_value,
+                                       uint32_t w, uint32_t h) {
+    if (!presenter_ || presenter_->IsDead()) return E_FAIL;
+    if (!tex) return E_NOT_VALID_STATE;
+
+    HRESULT hr = EnsureResourceImport(tex);
     if (FAILED(hr)) return hr;
-    hr = EnsureFenceImport(input_fence_.Get());
+    hr = EnsureFenceImport(fence);
     if (FAILED(hr)) return hr;
 
     // GPU-side wait on host's fence (no CPU stall) so our shader pass sees
     // host's writes.
     if (shared_fence_) {
-        bridge_ctx4_->Wait(shared_fence_.Get(), input_fence_value_);
+        bridge_ctx4_->Wait(shared_fence_.Get(), fence_value);
     }
 
     // Acquire the wrapped resource: D3D11On12 transitions it from OutState
@@ -347,8 +375,8 @@ HRESULT DX12Backend::Present() {
     // (our BGRA MISC_SHARED mirror that D3D9 opens via the KMT handle).
     D3D11_VIEWPORT vp{};
     vp.TopLeftX = 0; vp.TopLeftY = 0;
-    vp.Width    = static_cast<float>(input_w_);
-    vp.Height   = static_cast<float>(input_h_);
+    vp.Width    = static_cast<float>(w);
+    vp.Height   = static_cast<float>(h);
     vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
 
     ID3D11RenderTargetView* rtvs[] = { output_rtv_.Get() };
@@ -404,10 +432,15 @@ HRESULT DX12Backend::Present() {
         bridge_ctx_->Flush();
     }
 
-    return presenter_->Present(d3d9_sfc_.Get(), input_w_, input_h_);
+    return presenter_->Present(d3d9_sfc_.Get(), w, h);
 }
 
 void DX12Backend::Delete() {
+    // Drain + join the worker FIRST so it isn't holding any of the bridge
+    // / D3D9 / wrapped-resource state below when we Release it. Workers
+    // blocked on cvWork wake on stop=true and return cleanly.
+    async_.Stop();
+
     suppressor_.Uninstall();
 
     const bool dead = presenter_ && presenter_->IsDead();

@@ -60,6 +60,9 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
     }
 
     if (params_.enable_suppressor) suppressor_.Install();
+
+    // Spawn the async present worker — same role as in DX12Backend.
+    async_.Start();
     return S_OK;
 }
 
@@ -218,6 +221,18 @@ HRESULT VulkanBackend::Present(uint64_t sem_value) {
     if (!presenter_ || presenter_->IsDead()) return E_FAIL;
     if (!shared_tex_ || !d3d9_sfc_) return E_NOT_VALID_STATE;
 
+    // The only per-frame state is the timeline-semaphore value. Everything
+    // else (shared_tex_, legacy_shared_, sync_query_, etc.) is bridge state
+    // owned by us — safe to access from the worker.
+    return async_.Submit([this, sem_value]() {
+        return PresentSyncBody(sem_value);
+    });
+}
+
+HRESULT VulkanBackend::PresentSyncBody(uint64_t sem_value) {
+    if (!presenter_ || presenter_->IsDead()) return E_FAIL;
+    if (!shared_tex_ || !d3d9_sfc_) return E_NOT_VALID_STATE;
+
     bridge_ctx4_->Wait(shared_fence_.Get(), sem_value);
     bridge_ctx_->CopyResource(legacy_shared_.Get(), shared_tex_.Get());
 
@@ -253,6 +268,9 @@ HRESULT VulkanBackend::Present(uint64_t sem_value) {
 }
 
 void VulkanBackend::Delete() {
+    // Drain + join the worker before releasing bridge / D3D9 state.
+    async_.Stop();
+
     suppressor_.Uninstall();
     const bool dead = presenter_ && presenter_->IsDead();
     if (dead) {

@@ -3,6 +3,7 @@
 #ifndef NV3DLIB_DISABLE_OGL
 
 #include "NV3D.hpp"
+#include "async_presenter.h"
 #include "d3d9_presenter.h"
 #include "nv_3dvision_suppressor.h"
 #include "present_window.h"
@@ -52,6 +53,13 @@ private:
     bool       flip_y_    = true;
 
     std::unique_ptr<OGLBackendState> state_;
+
+    // SPLIT ASYNC. Only the D3D9Presenter::Present call runs on the worker;
+    // the GL-interop work (wglDXLockObjectsNV → glBlitFramebuffer →
+    // wglDXUnlockObjectsNV) stays on the caller's thread because a GL
+    // context can be current on at most one thread at a time and the host
+    // owns theirs.
+    AsyncPresenter                  async_;
 };
 
 }  // namespace NV3D

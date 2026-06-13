@@ -16,6 +16,7 @@
 #ifndef NV3DLIB_DISABLE_DX11
 
 #include "NV3D.hpp"
+#include "async_presenter.h"
 #include "d3d9_presenter.h"
 #include "nv_3dvision_suppressor.h"
 #include "present_window.h"
@@ -44,6 +45,13 @@ private:
     std::unique_ptr<PresentWindow>  window_;
     std::unique_ptr<D3D9Presenter>  presenter_;
     Nv3DVisionSuppressor            suppressor_;
+
+    // SPLIT ASYNC. Only the final presenter_->Present (D3D9 StretchRect +
+    // vsync'd PresentEx) runs on the worker; the host-context CopyResource
+    // + EVENT-query sync above it stays on the caller's thread because
+    // ID3D11DeviceContext immediate contexts are not thread-safe and we
+    // can't assume the host isn't also using theirs concurrently.
+    AsyncPresenter                  async_;
 
     Microsoft::WRL::ComPtr<ID3D11Device>        host_device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> host_ctx_;

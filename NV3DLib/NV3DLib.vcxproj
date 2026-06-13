@@ -95,6 +95,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="include\NV3D.hpp" />
+    <ClInclude Include="src\async_presenter.h" />
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\present_window.h" />
     <ClInclude Include="src\d3d9_presenter.h" />

@@ -3,6 +3,7 @@
 #ifndef NV3DLIB_DISABLE_VULKAN
 
 #include "NV3D.hpp"
+#include "async_presenter.h"
 #include "d3d9_presenter.h"
 #include "nv_3dvision_suppressor.h"
 #include "present_window.h"
@@ -49,11 +50,17 @@ public:
 private:
     bool ResolveAdapterLuid(LUID* out_luid);
     bool CreateBridgeDevice(LUID adapter_luid);
+    HRESULT PresentSyncBody(uint64_t sem_value);
 
     InitParams params_{};
     std::unique_ptr<PresentWindow> window_;
     std::unique_ptr<D3D9Presenter> presenter_;
     Nv3DVisionSuppressor           suppressor_;
+
+    // Off-thread present worker — same role as in DX12Backend. Bridge state
+    // and the D3D9 presenter are all lib-owned so the worker can use them
+    // safely without any synchronization with the host's render thread.
+    AsyncPresenter                 async_;
 
     NV3DVkInstance       inst_ = {};
     NV3DVkPhysicalDevice phys_ = {};

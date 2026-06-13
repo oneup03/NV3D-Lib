@@ -43,6 +43,10 @@ HRESULT DX11Backend::Init(ID3D11Device* device, const InitParams& params) {
     }
 
     if (params_.enable_suppressor) suppressor_.Install();
+
+    // Split-async present worker. Only the final D3D9 Present call is
+    // moved off-thread (see Present() below for why).
+    async_.Start();
     return S_OK;
 }
 
@@ -209,11 +213,29 @@ HRESULT DX11Backend::Present() {
     HRESULT hr = WaitForDx11Writes();
     if (FAILED(hr)) return hr;
 
-    return presenter_->Present(shared_d3d9_sfc_.Get(), input_w_, input_h_);
+    // SPLIT ASYNC. Everything above this point ran on the calling thread:
+    //   - host_ctx_->CopyResource (if mirror path) — uses HOST'S immediate
+    //     context, can't move to a worker without external synchronization
+    //     because the host may also be using their context.
+    //   - WaitForDx11Writes (host_ctx_ End/Flush/GetData EVENT spin) — same
+    //     constraint; uses the host's immediate context.
+    // From here down only the D3D9Presenter is involved — that's our own
+    // device, created with D3DCREATE_MULTITHREADED, so the worker can take
+    // over the StretchRect + vsync'd PresentEx without thread-safety
+    // concerns. The vsync wait is the biggest single cost; off-loading
+    // just it captures most of the latency win.
+    Microsoft::WRL::ComPtr<IDirect3DSurface9> snap_sfc = shared_d3d9_sfc_;
+    const uint32_t snap_w = input_w_;
+    const uint32_t snap_h = input_h_;
+    return async_.Submit([this, snap_sfc, snap_w, snap_h]() {
+        return presenter_->Present(snap_sfc.Get(), snap_w, snap_h);
+    });
 }
 
 void DX11Backend::Delete() {
     // Teardown order matches VRto3D:
+    //   0. Drain + join the async worker. Required FIRST so the worker
+    //      isn't mid-D3D9-Present when we tear D3D9 down below.
     //   1. Uninstall the in-process NV3D suppressor (unhook nvd3dumx.dll &
     //      user32.dll) — done BEFORE D3D9 release so the driver isn't being
     //      held while we're unhooking it.
@@ -222,6 +244,7 @@ void DX11Backend::Delete() {
     //      wedged device blocks in the kernel-mode driver.
     //   3. Tear down the D3D9 device + NvAPI (D3D9Presenter::Shutdown).
     //   4. Destroy the present window LAST.
+    async_.Stop();
     suppressor_.Uninstall();
 
     const bool dead = presenter_ && presenter_->IsDead();

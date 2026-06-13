@@ -178,6 +178,11 @@ HRESULT OGLBackend::Init(HGLRC ctx, HDC dc, const InitParams& params) {
     }
 
     if (params_.enable_suppressor) suppressor_.Install();
+
+    // Split-async present worker (only the D3D9 Present runs off-thread —
+    // the GL-interop work above it stays on the calling thread because the
+    // host's GL context can only be current on one thread at a time).
+    async_.Start();
     return S_OK;
 }
 
@@ -288,14 +293,23 @@ HRESULT OGLBackend::Present() {
         return E_FAIL;
     }
 
-    return presenter_->Present(state_->d3d9_target_sfc.Get(),
-                                 static_cast<uint32_t>(input_w_),
-                                 static_cast<uint32_t>(input_h_));
+    // SPLIT ASYNC. Everything above ran on the host's GL thread (the
+    // ScopedGLContext is about to go out of scope and restore whatever the
+    // host had current). Only the D3D9 StretchRect + vsync'd PresentEx
+    // moves to the worker — the D3D9 device is ours (MULTITHREADED), so
+    // the worker can safely drive it from a different thread.
+    Microsoft::WRL::ComPtr<IDirect3DSurface9> snap_sfc = state_->d3d9_target_sfc;
+    const uint32_t snap_w = static_cast<uint32_t>(input_w_);
+    const uint32_t snap_h = static_cast<uint32_t>(input_h_);
+    return async_.Submit([this, snap_sfc, snap_w, snap_h]() {
+        return presenter_->Present(snap_sfc.Get(), snap_w, snap_h);
+    });
 }
 
 void OGLBackend::Delete() {
-    // Teardown ordering mirrors DX11 backend: suppressor first, GL/D3D9
-    // child resources next, presenter, then window.
+    // Teardown ordering mirrors DX11 backend: drain worker, suppressor
+    // first, GL/D3D9 child resources next, presenter, then window.
+    async_.Stop();
     suppressor_.Uninstall();
 
     const bool dead = presenter_ && presenter_->IsDead();

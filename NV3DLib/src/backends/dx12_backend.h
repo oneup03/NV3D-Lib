@@ -3,6 +3,7 @@
 #ifndef NV3DLIB_DISABLE_DX12
 
 #include "NV3D.hpp"
+#include "async_presenter.h"
 #include "d3d9_presenter.h"
 #include "nv_3dvision_suppressor.h"
 #include "present_window.h"
@@ -66,11 +67,23 @@ private:
     bool CreateSwizzleShaders();
     HRESULT EnsureResourceImport(ID3D12Resource* sbs);
     HRESULT EnsureFenceImport(ID3D12Fence* fence);
+    // Synchronous body of Present(). Executes on the worker thread.
+    // Per-frame state is passed in (not read from members) so the host
+    // can call SetInputTexture for the next frame without racing with
+    // this worker's reads.
+    HRESULT PresentSyncBody(ID3D12Resource* tex, ID3D12Fence* fence,
+                             uint64_t fence_value,
+                             uint32_t w, uint32_t h);
 
     InitParams params_{};
     std::unique_ptr<PresentWindow> window_;
     std::unique_ptr<D3D9Presenter> presenter_;
     Nv3DVisionSuppressor           suppressor_;
+
+    // Worker that runs PresentSyncBody() so callers don't pay the EVENT-
+    // query spin + D3D9 PresentEx vsync on the host's render thread. Started
+    // by Init() after bridge bring-up; drained + joined in Delete().
+    AsyncPresenter                 async_;
 
     Microsoft::WRL::ComPtr<ID3D12Device>            host_device_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue>      host_queue_;        // unused by us, retained for completeness
