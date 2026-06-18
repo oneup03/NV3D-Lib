@@ -81,6 +81,8 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
         getInstProcAddr(reinterpret_cast<VkInstance>(inst_),
                           "vkGetPhysicalDeviceProperties2"));
 
+    NV3D_LOG_INFO(L"ResolveAdapterLuid start");
+
     NV3D_LOG_INFO(L"vkGetPhysProps2=%p", vkGetPhysProps2);
 
     if (!vkGetPhysProps2) {
@@ -98,7 +100,9 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &id_props;
     NV3D_LOG_INFO(L"calling vkGetPhysicalDeviceProperties2");
+    NV3D_LOG_INFO(L"before vkGetPhysicalDeviceProperties2");
     vkGetPhysProps2(reinterpret_cast<VkPhysicalDevice>(phys_), &props2);
+    NV3D_LOG_INFO(L"after vkGetPhysicalDeviceProperties2");
     if (!id_props.deviceLUIDValid) return false;
     static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size mismatch");
     std::memcpy(out_luid, id_props.deviceLUID, sizeof(LUID));
