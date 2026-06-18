@@ -109,6 +109,8 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     return true;
 }
 
+LOGI(L"calling vkGetPhysicalDeviceProperties2");
+
 bool VulkanBackend::CreateBridgeDevice(LUID adapter_luid) {
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
@@ -317,6 +319,10 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
                                           uint32_t queue_family_index,
                                           const InitParams* params,
                                           InterfaceVulkan** out) {
+    LOGI(L"CreateInterfaceVulkan");
+    LOGI(L"instance=%p", instance);
+    LOGI(L"phys=%p", phys);
+    LOGI(L"device=%p", device);
     if (!instance || !phys || !device || !params || !out) return E_POINTER;
     auto* impl = new VulkanBackend();
     HRESULT hr = impl->Init(instance, phys, device, queue_family_index, *params);
