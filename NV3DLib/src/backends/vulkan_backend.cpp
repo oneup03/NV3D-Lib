@@ -25,8 +25,7 @@ PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
     if (!m) return nullptr;
     return reinterpret_cast<PFN_vkGetInstanceProcAddr>(
         GetProcAddress(m, "vkGetInstanceProcAddr"));
-    NV3D_LOG_INFO(L"received inst_=%p", inst_);
-    NV3D_LOG_INFO(L"vulkan-1.dll=%p", m);
+    NV3D_LOG_INFO(L"vulkan-1.dll module=%p", m);
 }
 
 }  // anonymous
@@ -115,15 +114,14 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     if (!id_props.deviceLUIDValid) return false;
     static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size mismatch");
     std::memcpy(out_luid, id_props.deviceLUID, sizeof(LUID));
-    return true;
     NV3D_LOG_INFO(
         L"received inst_=%p phys_=%p dev_=%p",
         inst_,
         phys_,
         device_);
+    return true;
 }
 
-LOGI(L"calling vkGetPhysicalDeviceProperties2");
 
 bool VulkanBackend::CreateBridgeDevice(LUID adapter_luid) {
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
@@ -333,9 +331,6 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
                                           uint32_t queue_family_index,
                                           const InitParams* params,
                                           InterfaceVulkan** out) {
-    NV3D_LOG_INFO(
-    L"received instance=%p",
-    inst_);
     LOGI(L"CreateInterfaceVulkan");
     LOGI(L"instance=%p", instance);
     LOGI(L"phys=%p", phys);
