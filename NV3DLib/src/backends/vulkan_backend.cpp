@@ -323,11 +323,19 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
         phys,
         device);
 
+    auto gipa = LoadVulkanLoader();
+
+    NV3D_LOG_INFO(L"gipa=%p", gipa);
+
     auto vkDestroyInstance =
         reinterpret_cast<PFN_vkDestroyInstance>(
-            LoadVulkanLoader()(
-                reinterpret_cast<VkInstance>(instance),
+            gipa(
+                VK_NULL_HANDLE,
                 "vkDestroyInstance"));
+
+    NV3D_LOG_INFO(
+        L"vkDestroyInstance=%p",
+        vkDestroyInstance);
 
     NV3D_LOG_INFO(
         L"vkDestroyInstance=%p",
