@@ -336,6 +336,21 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
     NV3D_LOG_INFO(L"phys=%p", phys);
     NV3D_LOG_INFO(L"device=%p", device);
     if (!instance || !phys || !device || !params || !out) return E_POINTER;
+    NV3D_LOG_INFO(
+        L"instance=%p phys=%p device=%p",
+        instance,
+        phys,
+        device);
+
+    auto vkDestroyInstance =
+        reinterpret_cast<PFN_vkDestroyInstance>(
+            LoadVulkanLoader()(
+                reinterpret_cast<VkInstance>(instance),
+                "vkDestroyInstance"));
+
+    NV3D_LOG_INFO(
+        L"vkDestroyInstance=%p",
+        vkDestroyInstance);
     auto* impl = new VulkanBackend();
     HRESULT hr = impl->Init(instance, phys, device, queue_family_index, *params);
     if (FAILED(hr)) {
