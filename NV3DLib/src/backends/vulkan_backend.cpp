@@ -69,10 +69,11 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
 
 bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid)
 {
+    NV3D_LOG_INFO(L"*** HARDCODED ResolveAdapterLuid ***");
+
     out_luid->LowPart  = 0x0066B499;
     out_luid->HighPart = 0x00000000;
 
-    NV3D_LOG_INFO(L"Using hardcoded test LUID");
     return true;
 }
 
