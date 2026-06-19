@@ -33,37 +33,63 @@ PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
 HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
                               NV3DVkDevice dev, uint32_t qfi,
                               const InitParams& params) {
+
+NV3D_LOG_INFO(L"Init step 1");
     if (!inst || !phys || !dev) return E_POINTER;
+NV3D_LOG_INFO(L"Init step 2");
     params_ = params;
+NV3D_LOG_INFO(L"Init step 3");
     inst_ = inst; phys_ = phys; dev_ = dev; qfi_ = qfi;
 
+NV3D_LOG_INFO(L"Init step 4");
     LUID luid{};
+NV3D_LOG_INFO(L"Init step 5");
     if (!ResolveAdapterLuid(&luid)) {
+NV3D_LOG_INFO(L"Init step 6");
         NV3D_LOG_ERROR(L"VulkanBackend: could not resolve adapter LUID from VkPhysicalDevice");
+NV3D_LOG_INFO(L"Init step 7");
         return E_FAIL;
     }
+NV3D_LOG_INFO(L"Init step 8");
     if (!CreateBridgeDevice(luid)) return E_FAIL;
 
+NV3D_LOG_INFO(L"Init step 9");
     window_ = std::make_unique<PresentWindow>();
+NV3D_LOG_INFO(L"Init step 10");
     PresentWindowConfig wcfg{};
+NV3D_LOG_INFO(L"Init step 11");
     wcfg.target_monitor = params.target_monitor;
+NV3D_LOG_INFO(L"Init step 12");
     wcfg.host_hwnd      = params.host_hwnd;
+NV3D_LOG_INFO(L"Init step 13");
     wcfg.on_top         = params.on_top;
+NV3D_LOG_INFO(L"Init step 14");
     wcfg.title          = L"NV3DLib (Vulkan)";
+NV3D_LOG_INFO(L"Init step 15");
     if (!window_->Init(wcfg)) {
+NV3D_LOG_INFO(L"Init step 16");
         NV3D_LOG_ERROR(L"VulkanBackend: PresentWindow::Init failed");
+NV3D_LOG_INFO(L"Init step 17");
         return E_FAIL;
     }
+NV3D_LOG_INFO(L"Init step 18");
     presenter_ = std::make_unique<D3D9Presenter>();
+NV3D_LOG_INFO(L"Init step 19");
     if (!presenter_->Init(window_.get(), params)) {
+NV3D_LOG_INFO(L"Init step 20");
         NV3D_LOG_ERROR(L"VulkanBackend: D3D9Presenter::Init failed");
+NV3D_LOG_INFO(L"Init step 21");
         return E_FAIL;
     }
 
+NV3D_LOG_INFO(L"Init step 22");
     if (params_.enable_suppressor) suppressor_.Install();
 
+NV3D_LOG_INFO(L"Init step 23");
     // Spawn the async present worker — same role as in DX12Backend.
+NV3D_LOG_INFO(L"Init step 24");
     async_.Start();
+NV3D_LOG_INFO(L"Init step 25");
     return S_OK;
 }
 
