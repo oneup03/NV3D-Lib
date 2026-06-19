@@ -89,8 +89,6 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
         getInstProcAddr(reinterpret_cast<VkInstance>(inst_),
                           "vkGetPhysicalDeviceProperties2"));
 
-    NV3D_LOG_INFO(L"ResolveAdapterLuid start");
-
     NV3D_LOG_INFO(L"vkGetPhysProps2=%p", vkGetPhysProps2);
 
     if (!vkGetPhysProps2) {
@@ -115,10 +113,9 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size mismatch");
     std::memcpy(out_luid, id_props.deviceLUID, sizeof(LUID));
     NV3D_LOG_INFO(
-        L"received inst_=%p phys_=%p dev_=%p",
+        L"LUID resolved successfully inst_=%p phys_=%p",
         inst_,
-        phys_,
-        device_);
+        phys_);
     return true;
 }
 
@@ -331,10 +328,10 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
                                           uint32_t queue_family_index,
                                           const InitParams* params,
                                           InterfaceVulkan** out) {
-    LOGI(L"CreateInterfaceVulkan");
-    LOGI(L"instance=%p", instance);
-    LOGI(L"phys=%p", phys);
-    LOGI(L"device=%p", device);
+    NV3D_LOG_INFO(L"CreateInterfaceVulkan");
+    NV3D_LOG_INFO(L"instance=%p", instance);
+    NV3D_LOG_INFO(L"phys=%p", phys);
+    NV3D_LOG_INFO(L"device=%p", device);
     if (!instance || !phys || !device || !params || !out) return E_POINTER;
     auto* impl = new VulkanBackend();
     HRESULT hr = impl->Init(instance, phys, device, queue_family_index, *params);
