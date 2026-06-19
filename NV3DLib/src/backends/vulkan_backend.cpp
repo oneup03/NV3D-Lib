@@ -86,10 +86,13 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     NV3D_LOG_INFO(
         L"vkGetInstanceProcAddr(instance, vkGetPhysicalDeviceProperties2)");
     auto vkGetPhysProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
-        getInstProcAddr(reinterpret_cast<VkInstance>(inst_),
-                          "vkGetPhysicalDeviceProperties2"));
+        getInstProcAddr(
+            VK_NULL_HANDLE,
+            "vkGetPhysicalDeviceProperties2"));
 
-    NV3D_LOG_INFO(L"vkGetPhysProps2=%p", vkGetPhysProps2);
+    NV3D_LOG_INFO(
+        L"vkGetPhysProps2=%p",
+        vkGetPhysProps2);
 
     if (!vkGetPhysProps2) {
         vkGetPhysProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
