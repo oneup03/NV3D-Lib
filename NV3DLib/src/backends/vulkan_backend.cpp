@@ -311,6 +311,7 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
                                           uint32_t queue_family_index,
                                           const InitParams* params,
                                           InterfaceVulkan** out) {
+    NV3D_LOG_INFO(L"CreateInterfaceVulkan step 1");
     NV3D_LOG_INFO(L"CreateInterfaceVulkan");
     NV3D_LOG_INFO(L"instance=%p", instance);
     NV3D_LOG_INFO(L"phys=%p", phys);
@@ -332,7 +333,9 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
         L"vkDestroyInstance=%p",
         vkDestroyInstance);
     auto* impl = new VulkanBackend();
+    NV3D_LOG_INFO(L"CreateInterfaceVulkan step 2");
     HRESULT hr = impl->Init(instance, phys, device, queue_family_index, *params);
+    NV3D_LOG_INFO(L"CreateInterfaceVulkan step 3");
     if (FAILED(hr)) {
         impl->Delete();
         return hr;
