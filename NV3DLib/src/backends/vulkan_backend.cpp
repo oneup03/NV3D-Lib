@@ -69,13 +69,10 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
 
 bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid)
 {
-    NV3D_LOG_INFO(L"ResolveAdapterLuid BYPASSED");
+    out_luid->LowPart  = 0x0066B499;
+    out_luid->HighPart = 0x00000000;
 
-    memset(out_luid, 0, sizeof(LUID));
-
-    // fill using the LUID printed by VKS3D
-    // temporary test
-
+    NV3D_LOG_INFO(L"Using hardcoded test LUID");
     return true;
 }
 
