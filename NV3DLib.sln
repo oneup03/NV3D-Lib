@@ -5,14 +5,6 @@ VisualStudioVersion = 17.1.32210.238
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "NV3DLib", "NV3DLib\NV3DLib.vcxproj", "{0A3D6D52-9B27-4D4A-9D8A-7C4F1B0E9C01}"
 EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DX11Sample", "samples\DX11Sample\DX11Sample.vcxproj", "{1A3D6D52-9B27-4D4A-9D8A-7C4F1B0E9C10}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "OGLSample", "samples\OGLSample\OGLSample.vcxproj", "{1A3D6D52-9B27-4D4A-9D8A-7C4F1B0E9C11}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "DX12Sample", "samples\DX12Sample\DX12Sample.vcxproj", "{1A3D6D52-9B27-4D4A-9D8A-7C4F1B0E9C12}"
-EndProject
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "VulkanSample", "samples\VulkanSample\VulkanSample.vcxproj", "{1A3D6D52-9B27-4D4A-9D8A-7C4F1B0E9C13}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug-MT|x86 = Debug-MT|x86
