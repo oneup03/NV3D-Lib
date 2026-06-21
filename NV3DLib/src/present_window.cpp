@@ -174,6 +174,35 @@ void PresentWindow::SetWantVisible(bool visible) {
     want_visible_.store(visible, std::memory_order_relaxed);
 }
 
+void PresentWindow::RemoveClickThrough() {
+    if (!hwnd_) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    if ((ex & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) == 0) {
+        click_through_.store(false, std::memory_order_relaxed);
+        return;
+    }
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT));
+    click_through_.store(false, std::memory_order_relaxed);
+    NV3D_LOG_INFO(L"PresentWindow: RemoveClickThrough exstyle 0x%08lX -> 0x%08lX",
+                   static_cast<unsigned long>(ex),
+                   static_cast<unsigned long>(ex & ~(WS_EX_LAYERED | WS_EX_TRANSPARENT)));
+
+    // Pump pending messages so DWM processes the WS_EX_LAYERED removal
+    // before the D3D9Ex device releases. Without this settle, the DWM
+    // compositing state for the (formerly) layered FSE window races with
+    // D3D9 device release and freezes the OS-wide input loop. VRto3D's
+    // NvStereoDx9Presenter::RemoveFseSubclass uses the same 5×500 ms pattern.
+    MSG msg;
+    for (int i = 0; i < 5; ++i) {
+        while (PeekMessageW(&msg, hwnd_, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        Sleep(500);
+    }
+    NV3D_LOG_INFO(L"PresentWindow: DWM settle complete after click-through removal");
+}
+
 void PresentWindow::ApplyClickThrough() {
     if (!hwnd_) return;
     // WS_EX_LAYERED + WS_EX_TRANSPARENT — VRto3D's exact pattern from

@@ -89,6 +89,16 @@ bool D3D9Presenter::Init(PresentWindow* window, const InitParams& params) {
 void D3D9Presenter::Shutdown() {
     const bool dead = d3d9_dead_.load(std::memory_order_acquire);
 
+    // 0. Strip WS_EX_LAYERED | WS_EX_TRANSPARENT from the FSE window FIRST
+    //    and let DWM settle. Doing this after the D3D9 release races with
+    //    DWM's compositing state for the layered window and freezes input
+    //    OS-wide on some configs (VRto3D's NvStereoDx9Presenter does the
+    //    same thing in RemoveFseSubclass for the same reason). Skipped on
+    //    the dead-device path because the GPU has already TDR'd anyway.
+    if (!dead && window_) {
+        window_->RemoveClickThrough();
+    }
+
     // 1. NvAPI stereo handle.
     //    Skipping DestroyHandle on a dead device is intentional — that call
     //    can block in the kernel-mode driver waiting for GPU work that will
