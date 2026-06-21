@@ -33,6 +33,7 @@ public:
 
     HRESULT SetInputTexture(ID3D11Texture2D* sbs_tex) override;
     HRESULT Present() override;
+    void    SetVisible(bool visible) override;
     void    Delete() override;
 
 private:

@@ -91,6 +91,15 @@ struct InitParams {
     // works even if NvAPI_Stereo_IsActivated never reports true, so the
     // retry budget is mostly diagnostic.
     int activation_retry_budget = 60;
+
+    // Tracked-game PID. When non-zero, the library uses VRto3D's
+    // FocusThreadLoop pattern: keep the FSE popup on HWND_TOPMOST, force the
+    // tracked game's window into the foreground when our popup first goes on
+    // top, and re-assert topmost ~every 500 ms. Set this to the PID of the
+    // game/app the host is capturing for. Leave at 0 to keep the default
+    // library-owned mode (auto-minimize when the host process loses focus —
+    // suitable for VR runtimes that bring their own focus management).
+    DWORD tracked_game_pid = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -109,6 +118,16 @@ public:
     // Wait for the host's DX11 writes (ID3D11Query EVENT), then per-eye
     // SetActiveEye + StretchRect into the D3D9Ex back buffer + PresentEx.
     virtual HRESULT Present() = 0;
+
+    // Toggle the FSE popup visibility. Flipping to false has the library's
+    // window thread do a coordinated SW_MINIMIZE (releasing the FSE scan-out
+    // slot and the WndProc's deactivation suppression for one transition);
+    // flipping back to true reverses it (SW_RESTORE + topmost + re-armed
+    // suppression). The toggle is observed on the library's window thread —
+    // do not call ShowWindow on the popup HWND yourself; cross-thread
+    // ShowWindow on a FSE D3D9Ex device window wedges DWM and leaves the
+    // host's other windows non-responsive.
+    virtual void SetVisible(bool visible) = 0;
 
     // Tear down the library. Equivalent to deleting the object.
     virtual void Delete() = 0;
