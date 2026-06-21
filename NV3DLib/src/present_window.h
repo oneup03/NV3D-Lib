@@ -73,6 +73,16 @@ public:
     // mode.
     void ApplyClickThrough();
 
+    // Inverse of ApplyClickThrough — strip WS_EX_LAYERED | WS_EX_TRANSPARENT
+    // and pump messages so DWM processes the style change before the D3D9Ex
+    // device tears down. Without this settle step, the DWM's internal
+    // compositing state for the layered FSE window can race with D3D9
+    // release and FREEZE the display (mouse / keyboard hang OS-wide until
+    // the GPU driver recovers). VRto3D's NvStereoDx9Presenter::RemoveFseSubclass
+    // does the same thing. Call this from D3D9Presenter::Shutdown before
+    // releasing the device.
+    void RemoveClickThrough();
+
 private:
     static LRESULT CALLBACK SubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp);
 
