@@ -219,10 +219,13 @@ void PresentWindow::WindowThreadLoop() {
     GetMonitorInfoW(monitor_, &mi);
 
     DWORD style    = WS_POPUP | WS_VISIBLE;
-    // WS_EX_APPWINDOW forces the popup into the alt+tab list — without it,
-    // WS_POPUP windows don't get a taskbar / alt+tab entry, and a user who
-    // alt+tabs away can never bring our popup back without a hotkey.
-    DWORD style_ex = WS_EX_APPWINDOW | (cfg_.on_top ? WS_EX_TOPMOST : 0);
+    // WS_EX_TOOLWINDOW hides the popup from both alt+tab and the taskbar.
+    // We've had earlier iterations with WS_EX_APPWINDOW (to make it
+    // alt+tab-accessible) but that made it easy for users to alt+tab onto
+    // the FSE D3D9Ex device window directly, which tends to wedge the
+    // device + DWM — the popup is meant to be driven only by the host's
+    // hide/show toggle, never by the user picking it from the task switcher.
+    DWORD style_ex = WS_EX_TOOLWINDOW | (cfg_.on_top ? WS_EX_TOPMOST : 0);
 
     hwnd_ = CreateWindowExW(
         style_ex, wc.lpszClassName, cfg_.title.c_str(), style,
