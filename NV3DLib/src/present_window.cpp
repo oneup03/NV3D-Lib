@@ -2,6 +2,8 @@
 
 #include "log.h"
 
+#include <chrono>
+
 namespace NV3D {
 
 namespace {
@@ -28,6 +30,77 @@ bool QueryMonitorInfo(HMONITOR* mon_inout, uint32_t* w, uint32_t* h, float* refr
         *refresh = 60.0f;
     }
     return true;
+}
+
+// ---- VRto3D port: focus helpers --------------------------------------------
+// Ported verbatim from
+// VRto3D/external/VRto3DLib/include/vrto3dlib/win32_helper.hpp so NV3D-Glass-
+// style game-capture deployments (game running in another process, FSE popup
+// on top of it) can use the same focus/minimize behavior the SteamVR-side
+// NvStereoDx9Presenter relies on. Activated when InitParams::tracked_game_pid
+// is non-zero (see WindowThreadLoop below).
+
+bool IsProcessRunning(DWORD pid) {
+    if (!pid) return false;
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    DWORD exit_code = 0;
+    bool running = false;
+    if (GetExitCodeProcess(h, &exit_code)) {
+        running = (exit_code == STILL_ACTIVE);
+    }
+    CloseHandle(h);
+    return running;
+}
+
+HWND GetHWNDFromPID(DWORD target_pid) {
+    struct Ctx { DWORD pid; HWND result; } ctx { target_pid, nullptr };
+    EnumWindows([](HWND hw, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hw, &pid);
+        if (pid == c->pid && IsWindowVisible(hw)) {
+            c->result = hw;
+            return FALSE;   // stop enumeration
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.result;
+}
+
+void ForceForeground(HWND hwnd) {
+    HWND  fg     = GetForegroundWindow();
+    DWORD fg_tid = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    DWORD my_tid = GetCurrentThreadId();
+    if (fg_tid && fg_tid != my_tid) AttachThreadInput(my_tid, fg_tid, TRUE);
+    AllowSetForegroundWindow(GetCurrentProcessId());
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    SetFocus(hwnd);
+    if (fg_tid && fg_tid != my_tid) AttachThreadInput(my_tid, fg_tid, FALSE);
+}
+
+void ForceFocus(HWND target, DWORD my_tid, DWORD target_tid) {
+    // Dummy Alt up/down — wakes Win32's focus-lock logic so SetForegroundWindow
+    // is actually allowed. Mirrors VRto3D's ForceFocus exactly.
+    INPUT input{};
+    input.type = INPUT_KEYBOARD;
+    input.ki.wVk = VK_MENU;
+    SendInput(1, &input, sizeof(INPUT));
+    input.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &input, sizeof(INPUT));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    AttachThreadInput(my_tid, target_tid, TRUE);
+    ShowWindow(target, SW_RESTORE);
+    SetForegroundWindow(target);
+    SetFocus(target);
+    SetActiveWindow(target);
+    BringWindowToTop(target);
+    AttachThreadInput(my_tid, target_tid, FALSE);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
 }  // anonymous
@@ -67,14 +140,24 @@ bool PresentWindow::Init(const PresentWindowConfig& cfg) {
 }
 
 void PresentWindow::Shutdown() {
-    if (host_owned_ && hwnd_) {
+    // host_owned_ is the (badly named) "library-owned" flag — true when
+    // cfg.host_hwnd was null at Init and the library spawned its own window
+    // thread. The host-provided path skips the thread + window destruction
+    // because the host owns the HWND lifecycle.
+    //
+    // Earlier this check was inverted, which made the LIBRARY-owned path
+    // return without setting window_stop_ / joining the thread. The
+    // window_thread_ stayed joinable, so std::thread::~thread called
+    // std::terminate, killing the host process on every Stop.
+    if (!host_owned_ && hwnd_) {
         RemoveSubclass();
         hwnd_ = nullptr;
         return;
     }
 
-    // Hide first so the FSE window disappears immediately on shutdown,
-    // even if the rest of teardown takes a moment (D3D9 release etc.).
+    // Library-owned: full teardown. Hide first so the FSE window disappears
+    // immediately on shutdown, even if the rest of teardown takes a moment
+    // (D3D9 release etc.).
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
 
     window_stop_.store(true);
@@ -87,15 +170,34 @@ void PresentWindow::SetSuppressMinimize(bool suppress) {
     suppress_minimize_.store(suppress);
 }
 
+void PresentWindow::SetWantVisible(bool visible) {
+    want_visible_.store(visible, std::memory_order_relaxed);
+}
+
 void PresentWindow::ApplyClickThrough() {
-    if (!hwnd_ || host_owned_) return;
-    // WS_EX_LAYERED is required for WS_EX_TRANSPARENT to take effect on a
-    // top-level window. Alpha=255 means fully opaque — the only behavioural
-    // effect is that the window now participates in layered-input routing
-    // and ignores mouse messages, which is what we want for click-through.
+    if (!hwnd_) return;
+    // WS_EX_LAYERED + WS_EX_TRANSPARENT — VRto3D's exact pattern from
+    // NvStereoDx9Presenter::InstallFseSubclass. This is what actually makes
+    // clicks pass through to other-process windows underneath; the earlier
+    // WM_NCHITTEST→HTTRANSPARENT path only routes within our own thread, so
+    // clicks on the FSE area silently went nowhere for the user's game.
+    //
+    // SetLayeredWindowAttributes(alpha=255) keeps the window fully opaque;
+    // the only behavioural change is that the window is now ignored by
+    // mouse hit-testing. The D3D9Ex FSE scan-out should keep driving the
+    // display content as long as the fixed-staging + D3DCREATE_NOWINDOWCHANGES
+    // combo holds.
     LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
     SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TRANSPARENT);
     SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA);
+    // Also flip the WM_NCHITTEST→HTTRANSPARENT path for any in-process windows
+    // we might be drawing on top of (the host's own control panel, etc).
+    click_through_.store(true, std::memory_order_relaxed);
+    NV3D_LOG_INFO(L"PresentWindow: ApplyClickThrough exstyle 0x%08lX -> 0x%08lX "
+                   L"(host_owned=%s)",
+                   static_cast<unsigned long>(ex),
+                   static_cast<unsigned long>(ex | WS_EX_LAYERED | WS_EX_TRANSPARENT),
+                   host_owned_ ? L"library-owned" : L"host-provided");
 }
 
 void PresentWindow::WindowThreadLoop() {
@@ -117,7 +219,10 @@ void PresentWindow::WindowThreadLoop() {
     GetMonitorInfoW(monitor_, &mi);
 
     DWORD style    = WS_POPUP | WS_VISIBLE;
-    DWORD style_ex = cfg_.on_top ? WS_EX_TOPMOST : 0;
+    // WS_EX_APPWINDOW forces the popup into the alt+tab list — without it,
+    // WS_POPUP windows don't get a taskbar / alt+tab entry, and a user who
+    // alt+tabs away can never bring our popup back without a hotkey.
+    DWORD style_ex = WS_EX_APPWINDOW | (cfg_.on_top ? WS_EX_TOPMOST : 0);
 
     hwnd_ = CreateWindowExW(
         style_ex, wc.lpszClassName, cfg_.title.c_str(), style,
@@ -168,9 +273,12 @@ void PresentWindow::WindowThreadLoop() {
     // hook procedures can fault inside DispatchMessage's WndProc path or
     // inside ShowWindow's WM_SIZE/WM_WINDOWPOSCHANGED chain, especially
     // post-freeze when the driver state is mid-revalidation.
-    const DWORD self_pid = GetCurrentProcessId();
-    DWORD last_fg_check_ms = 0;
-    bool was_host_focused = true;  // popup starts visible w/ host as foreground
+    const DWORD self_pid    = GetCurrentProcessId();
+    const DWORD tracked_pid = cfg_.tracked_game_pid;
+    DWORD last_fg_check_ms  = 0;
+    bool was_host_focused   = true;  // popup starts visible w/ host as foreground
+    bool was_on_top         = false;
+    int  reassert_counter   = 0;
 
     auto seh_show_window = [](HWND h, int mode) {
         __try {
@@ -196,13 +304,72 @@ void PresentWindow::WindowThreadLoop() {
         }
     };
 
+    if (tracked_pid) {
+        NV3D_LOG_INFO(L"PresentWindow: VRto3D focus loop active, tracked_game_pid=%lu",
+                       static_cast<unsigned long>(tracked_pid));
+    }
+
     MSG msg;
     while (!window_stop_.load()) {
         if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) break;
             seh_dispatch(msg);
+            continue;
+        }
+
+        const DWORD now_ms = GetTickCount();
+
+        if (tracked_pid != 0) {
+            // Tracked-game-pid mode (VRto3D pattern). The popup stays put
+            // while the game is alive + want_visible_ is true; the window
+            // thread does all the SW_MINIMIZE/SW_RESTORE/topmost work itself
+            // so suppress_minimize_ can be sequenced safely.
+            //
+            // want_visible_ is flipped by the host via SetWantVisible() from
+            // a hotkey handler. Doing the ShowWindow on the host's main
+            // thread (cross-thread) while this thread's WndProc is absorbing
+            // WM_SIZE/WM_SYSCOMMAND wedges D3D9Ex FSE + DWM and leaves the
+            // host's other windows non-responsive. Always do it from here.
+            const bool app_running  = IsProcessRunning(tracked_pid);
+            const bool user_visible = want_visible_.load(std::memory_order_relaxed);
+            const bool want_up      = app_running && user_visible;
+
+            if (want_up && !was_on_top) {
+                // OFF→ON: re-arm suppression first, then restore, then put
+                // the popup back on its TOPMOST stack slot. We never call
+                // ForceForeground here — that wedges input via
+                // AttachThreadInput on the host process.
+                suppress_minimize_.store(true, std::memory_order_relaxed);
+                seh_show_window(hwnd_, SW_RESTORE);
+                SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                was_on_top = true;
+                NV3D_LOG_INFO(L"PresentWindow: popup restored");
+            } else if (!want_up && was_on_top) {
+                // ON→OFF: disarm suppression FIRST so the WndProc lets
+                // WM_SYSCOMMAND/SC_MINIMIZE and WM_SIZE/SIZE_MINIMIZED through
+                // — otherwise SW_MINIMIZE is a no-op.
+                suppress_minimize_.store(false, std::memory_order_relaxed);
+                seh_show_window(hwnd_, SW_MINIMIZE);
+                was_on_top = false;
+                if (!app_running) {
+                    NV3D_LOG_INFO(L"PresentWindow: tracked game pid=%lu exited — minimizing popup",
+                                   static_cast<unsigned long>(tracked_pid));
+                } else {
+                    NV3D_LOG_INFO(L"PresentWindow: user hid popup");
+                }
+            } else if (want_up) {
+                // Steady-state visible. Keep suppress_minimize_ pinned so
+                // stray deactivation messages don't push the FSE off-screen.
+                suppress_minimize_.store(true, std::memory_order_relaxed);
+            }
+
+            // 50 ms cadence so hotkey toggles feel responsive.
+            Sleep(50);
         } else {
-            const DWORD now_ms = GetTickCount();
+            // Legacy behavior: minimize-on-host-focus-loss. Suitable for VR
+            // / single-process consumers where the host process should keep
+            // foreground while presenting.
             if (now_ms - last_fg_check_ms >= 100 && !window_stop_.load()) {
                 last_fg_check_ms = now_ms;
                 HWND fg = GetForegroundWindow();
@@ -211,22 +378,9 @@ void PresentWindow::WindowThreadLoop() {
                 const bool host_focused = (fg_pid == self_pid);
 
                 if (host_focused && !was_host_focused) {
-                    // Transition: host regained foreground → restore FSE
-                    // popup so D3D9 re-engages exclusive scan-out. Re-arm
-                    // suppress_minimize_ FIRST so any focus-loss messages
-                    // that fire during the restore sequence don't push us
-                    // back to minimized.
                     suppress_minimize_.store(true);
                     seh_show_window(hwnd_, SW_RESTORE);
                 } else if (!host_focused && was_host_focused) {
-                    // Transition: host lost foreground (alt+tab to another
-                    // app) → first DISARM suppress_minimize_ so the
-                    // WM_NCACTIVATE FALSE / SC_MINIMIZE handlers stop
-                    // returning TRUE/0, then minimize. Without disarming
-                    // first the popup's WndProc subclass refuses to let
-                    // the window deactivate, ShowWindow(SW_MINIMIZE) is
-                    // effectively a no-op, and the alt+tabbed-to app stays
-                    // hidden behind the FSE popup.
                     suppress_minimize_.store(false);
                     seh_show_window(hwnd_, SW_MINIMIZE);
                 }
@@ -257,6 +411,16 @@ void PresentWindow::RemoveSubclass() {
 
 LRESULT CALLBACK PresentWindow::SubclassProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp) {
     auto* self = reinterpret_cast<PresentWindow*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
+
+    // Click-through hit testing — returning HTTRANSPARENT tells Win32 to
+    // dispatch the underlying mouse event to whatever window is beneath this
+    // one. Works without WS_EX_LAYERED, so the FSE D3D9 scan-out keeps
+    // driving the display.
+    if (self && msg == WM_NCHITTEST &&
+        self->click_through_.load(std::memory_order_relaxed)) {
+        return HTTRANSPARENT;
+    }
+
     // NOTE: WM_DISPLAYCHANGE is deliberately NOT treated as fatal here. FSE
     // D3D9Ex itself raises that message when it modesets the display for
     // fullscreen-exclusive entry — treating it as fatal kills the device on
@@ -274,6 +438,13 @@ LRESULT CALLBACK PresentWindow::SubclassProc(HWND hw, UINT msg, WPARAM wp, LPARA
                 return 0;
             case WM_NCACTIVATE:
                 if (wp == FALSE) return TRUE;
+                break;
+            case WM_SIZE:
+                // SIZE_MINIMIZED arrives when another fullscreen window forces
+                // us off-screen, or when a stray ShowWindow(SW_MINIMIZE) slips
+                // past us. Refusing to handle it keeps the FSE popup full-size
+                // and D3D9Ex's scan-out engaged.
+                if (wp == SIZE_MINIMIZED) return 0;
                 break;
             // SC_MINIMIZE / SC_SCREENSAVE / SC_MONITORPOWER all power-down or
             // minimize the FSE window; suppress while suppress_minimize_ is set.

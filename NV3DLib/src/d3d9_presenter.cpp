@@ -217,9 +217,15 @@ bool D3D9Presenter::BuildD3D9Stack() {
         pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
     };
 
+    // D3DCREATE_NOWINDOWCHANGES: tells D3D9 to NOT auto-handle window-state
+    // transitions itself. Without it, D3D9Ex FSE devices silently minimize the
+    // device window on Alt+Tab / WM_ACTIVATEAPP(FALSE) — bypassing the WndProc
+    // subclass that swallows WM_ACTIVATE / WM_NCACTIVATE / SC_MINIMIZE — and
+    // the popup just disappears for the user with no way to restore it.
     DWORD create_flags = D3DCREATE_HARDWARE_VERTEXPROCESSING
                        | D3DCREATE_MULTITHREADED
-                       | D3DCREATE_FPU_PRESERVE;
+                       | D3DCREATE_FPU_PRESERVE
+                       | D3DCREATE_NOWINDOWCHANGES;
 
     {
         bool mode_found = false;

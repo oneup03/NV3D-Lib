@@ -27,10 +27,11 @@ HRESULT DX11Backend::Init(ID3D11Device* device, const InitParams& params) {
 
     window_ = std::make_unique<PresentWindow>();
     PresentWindowConfig wcfg{};
-    wcfg.target_monitor = params.target_monitor;
-    wcfg.host_hwnd      = params.host_hwnd;
-    wcfg.on_top         = params.on_top;
-    wcfg.title          = L"NV3DLib (DX11)";
+    wcfg.target_monitor    = params.target_monitor;
+    wcfg.host_hwnd         = params.host_hwnd;
+    wcfg.on_top            = params.on_top;
+    wcfg.title             = L"NV3DLib (DX11)";
+    wcfg.tracked_game_pid  = params.tracked_game_pid;
     if (!window_->Init(wcfg)) {
         NV3D_LOG_ERROR(L"DX11Backend: PresentWindow::Init failed");
         return E_FAIL;
@@ -230,6 +231,10 @@ HRESULT DX11Backend::Present() {
     return async_.Submit([this, snap_sfc, snap_w, snap_h]() {
         return presenter_->Present(snap_sfc.Get(), snap_w, snap_h);
     });
+}
+
+void DX11Backend::SetVisible(bool visible) {
+    if (window_) window_->SetWantVisible(visible);
 }
 
 void DX11Backend::Delete() {
