@@ -357,7 +357,7 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
         NvAPI_Stereo_SetActiveEye(stereo_handle_, eye);
         HRESULT bhr = device9_->StretchRect(shared_input, &src,
                                               back_buffer_.Get(), nullptr,
-                                              D3DTEXF_POINT);
+                                              D3DTEXF_LINEAR);
         if (FAILED(bhr)) {
             NV3D_LOG_ERROR(L"StretchRect(shared->backbuf %hs) failed hr=0x%08X", eye_name, bhr);
             CheckAndMarkD3D9Dead(bhr, "StretchRect(shared->backbuf)");
