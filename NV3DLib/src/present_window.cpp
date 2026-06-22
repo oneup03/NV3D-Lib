@@ -158,11 +158,17 @@ void PresentWindow::Shutdown() {
     // Library-owned: full teardown. Hide first so the FSE window disappears
     // immediately on shutdown, even if the rest of teardown takes a moment
     // (D3D9 release etc.).
+    NV3D_LOG_INFO(L"PresentWindow::Shutdown  library-owned teardown begin hwnd=%p", (void*)hwnd_);
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
+    NV3D_LOG_INFO(L"PresentWindow::Shutdown  after cross-thread SW_HIDE");
 
     window_stop_.store(true);
     if (hwnd_) PostMessageW(hwnd_, WM_CLOSE, 0, 0);
-    if (window_thread_.joinable()) window_thread_.join();
+    if (window_thread_.joinable()) {
+        NV3D_LOG_INFO(L"PresentWindow::Shutdown  joining window thread");
+        window_thread_.join();
+        NV3D_LOG_INFO(L"PresentWindow::Shutdown  window thread joined");
+    }
     hwnd_ = nullptr;
 }
 
