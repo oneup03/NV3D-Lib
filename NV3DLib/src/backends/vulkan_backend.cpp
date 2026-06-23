@@ -111,6 +111,7 @@ bool VulkanBackend::CreateBridgeDevice(LUID adapter_luid) {
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> target_adapter;
+    bool found = false;
     for (UINT i = 0;; ++i) {
         Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
         if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
