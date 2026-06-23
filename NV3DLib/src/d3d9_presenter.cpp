@@ -128,10 +128,13 @@ void D3D9Presenter::Shutdown() {
         d3d9_.Reset();
     }
 
-    // LightBoost revert AFTER D3D9 release — the display is no longer FSE-
-    // locked at this point so NVAPI's RevertCustomDisplayTrial (or the
-    // ChangeDisplaySettingsExW fallback) can push the original timing.
-    lightboost_.Disable();
+    // No LightBoost revert. Enable() commits the timing to NVCP via
+    // NvAPI_DISP_SaveCustomDisplay; we deliberately leave it applied so it
+    // survives across host sessions (and across reboots). Removing the
+    // revert step also shrinks the teardown's blast radius — the old
+    // RevertCustomDisplayTrial + ChangeDisplaySettingsExW fallback ran
+    // after D3D9 release, during the DWM-reclaim window, and was a
+    // contributor to the post-quit display-freeze pattern.
 
     // NvAPI_Unload mirrors VRto3D's teardown step 5. Unconditional — runs
     // even on the dead-device path (NvAPI cleans up the leaked stereo handle

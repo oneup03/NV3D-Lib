@@ -234,7 +234,6 @@ bool LightBoost::Enable(const std::wstring& gdi_device_w,
     if (enabled_) return true;
 
     const std::string gdi_device = NvTimingsDb::ToUtf8(gdi_device_w);
-    gdi_device_ = gdi_device_w;
 
     NV3D_LOG_INFO(L"LightBoost: target gdi='%s'", gdi_device_w.c_str());
 
@@ -380,6 +379,29 @@ bool LightBoost::Enable(const std::wstring& gdi_device_w,
     if (has_original_target_timing_)
         WaitForTimingChange(display_ids_.front(), original_target_timing_, 10000);
 
+    // Commit the validated trial timing to NVCP's persistent custom-display
+    // registry. Without this, the timing would revert on reboot (or on any
+    // RevertCustomDisplayTrial call). Saving has several payoffs:
+    //   * LightBoost stays applied across reboots — users typically want this
+    //     on their 3DV panel permanently rather than re-enabling each session.
+    //   * No modeset / flicker on host shutdown (Disable is a no-op).
+    //   * Removes the post-D3D9-release ChangeDisplaySettingsExW fallback path
+    //     that was a contributor to the post-quit display-freeze pattern.
+    // (true, true) = per-output-id + per-monitor-id, matching the NvAPI SDK
+    // CustomTiming sample's parameters. To remove the saved timing, the user
+    // can delete the entry from NVIDIA Control Panel's custom resolutions.
+    NvAPI_Status saved = NvAPI_DISP_SaveCustomDisplay(
+        display_ids_.data(),
+        static_cast<NvU32>(display_ids_.size()),
+        /*isThisOutputIdOnly=*/  TRUE,
+        /*isThisMonitorIdOnly=*/ TRUE);
+    if (saved != NVAPI_OK) {
+        NV3D_LOG_WARN(L"LightBoost: SaveCustomDisplay s=%d — timing applied for this session "
+                       L"only (will revert on reboot)", saved);
+    } else {
+        NV3D_LOG_INFO(L"LightBoost: SaveCustomDisplay OK — timing persisted to NVCP");
+    }
+
     // Sync GDI's display mode to the new wire timing.
     if (has_original_devmode_ && matched_.refresh_int > 0) {
         DEVMODEW dm = original_devmode_;
@@ -394,39 +416,6 @@ bool LightBoost::Enable(const std::wstring& gdi_device_w,
     enabled_ = true;
     NV3D_LOG_INFO(L"LightBoost: applied custom timing");
     return true;
-}
-
-void LightBoost::Disable() {
-    if (!enabled_) return;
-    if (display_ids_.empty()) { enabled_ = false; return; }
-
-    NV_TIMING pre_revert{};
-    {
-        NV_TIMING_INPUT ti{}; ti.version = NV_TIMING_INPUT_VER;
-        NvAPI_DISP_GetTiming(display_ids_.front(), &ti, &pre_revert);
-    }
-
-    NvAPI_Status s = NvAPI_DISP_RevertCustomDisplayTrial(
-        display_ids_.data(), static_cast<NvU32>(display_ids_.size()));
-    NV3D_LOG_INFO(L"LightBoost: RevertCustomDisplayTrial s=%d", s);
-    WaitForModesetSettle(200);
-    WaitForTimingChange(display_ids_.front(), pre_revert, 3000);
-
-    if (s != NVAPI_OK && has_original_devmode_ && !gdi_device_.empty()) {
-        // Trial was invalidated by FSE D3D9Ex during the session — fall
-        // back to ChangeDisplaySettingsExW with the OS-stored DEVMODE.
-        NV3D_LOG_WARN(L"LightBoost: trial invalidated — DEVMODE fallback");
-        DEVMODEW dm = original_devmode_;
-        LONG rc = ChangeDisplaySettingsExW(gdi_device_.c_str(), &dm,
-                                             nullptr, CDS_FULLSCREEN, nullptr);
-        if (rc != DISP_CHANGE_SUCCESSFUL) {
-            ChangeDisplaySettingsExW(gdi_device_.c_str(), &dm,
-                                      nullptr, CDS_RESET | CDS_FULLSCREEN, nullptr);
-        }
-        WaitForModesetSettle(500);
-    }
-
-    enabled_ = false;
 }
 
 }  // namespace NV3D
