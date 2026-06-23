@@ -1,15 +1,23 @@
 /*
  * LightBoost — apply NVIDIA custom display timings to drive 3D Vision panels
- * in low-persistence (strobed backlight) mode. Ported from VRto3D.
+ * in low-persistence (strobed backlight) mode. Originally ported from VRto3D.
  *
- * Lifecycle:
- *   - Enable(): looks up the target panel's EDID in nvtimings.json, calls
- *     NvAPI_DISP_TryCustomDisplay, syncs GDI's DEVMODE via
- *     ChangeDisplaySettingsExW so apps see the new refresh.
- *   - Disable(): reverts via NvAPI_DISP_RevertCustomDisplayTrial; if that
- *     fails (the trial state gets invalidated by FSE D3D9Ex modesets during
- *     the session, common on 3D Vision panels), falls back to
- *     ChangeDisplaySettingsExW with the original DEVMODE snapshot.
+ * Enable():
+ *   1. Looks up the target panel's EDID in nvtimings.json.
+ *   2. Calls NvAPI_DISP_TryCustomDisplay to validate the timing on the live
+ *      hardware.
+ *   3. Calls NvAPI_DISP_SaveCustomDisplay to commit the validated timing to
+ *      NVCP's persistent custom-display registry — it survives reboot and
+ *      stays applied across host sessions.
+ *   4. Syncs GDI's DEVMODE via ChangeDisplaySettingsExW so apps see the new
+ *      refresh.
+ *
+ * There is no Disable. We deliberately leave the saved timing in place: most
+ * users want LightBoost on their 3DV panel permanently, and reverting on
+ * shutdown caused a modeset right after D3D9 release (during the DWM-reclaim
+ * window) that contributed to post-quit display freezes. To remove the
+ * saved timing the user deletes the entry from NVIDIA Control Panel →
+ * Change resolution → Customize.
  *
  * Non-fatal: any failure logs + leaves the panel untouched. Calling Enable()
  * on a panel that's already in the target timing is a no-op.
@@ -56,8 +64,8 @@ private:
 
 class LightBoost {
 public:
-    LightBoost() = default;
-    ~LightBoost() { Disable(); }
+    LightBoost()  = default;
+    ~LightBoost() = default;
 
     LightBoost(const LightBoost&)            = delete;
     LightBoost& operator=(const LightBoost&) = delete;
@@ -72,9 +80,6 @@ public:
     bool Enable(const std::wstring& gdi_device_w,
                   const std::wstring& json_path = L"");
 
-    // Revert any applied custom timing. Safe to call when not enabled.
-    void Disable();
-
     bool IsEnabled() const { return enabled_; }
 
 private:
@@ -86,7 +91,6 @@ private:
     bool                       enabled_ = false;
     std::vector<NvU32>         display_ids_;
     NvTimingsEntry             matched_{};
-    std::wstring               gdi_device_;
     NV_TIMING                  original_target_timing_{};
     bool                       has_original_target_timing_ = false;
     DEVMODEW                   original_devmode_{};
