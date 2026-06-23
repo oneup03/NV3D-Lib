@@ -37,10 +37,17 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
     inst_ = inst; phys_ = phys; dev_ = dev; qfi_ = qfi;
 
     LUID luid{};
-    if (!ResolveAdapterLuid(&luid)) {
-        NV3D_LOG_ERROR(L"VulkanBackend: could not resolve adapter LUID from VkPhysicalDevice");
-        return E_FAIL;
+    
+    if (params.has_external_luid) {
+        luid = params.external_luid;
+        NV3D_LOG_INFO(L"VulkanBackend: using external LUID (injected)");
+    } else {
+        if (!ResolveAdapterLuid(&luid)) {
+            NV3D_LOG_ERROR(L"VulkanBackend: could not resolve adapter LUID from VkPhysicalDevice");
+            return E_FAIL;
+        }
     }
+    
     if (!CreateBridgeDevice(luid)) return E_FAIL;
 
     window_ = std::make_unique<PresentWindow>();
@@ -90,9 +97,13 @@ bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
     props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
     props2.pNext = &id_props;
     vkGetPhysProps2(reinterpret_cast<VkPhysicalDevice>(phys_), &props2);
-    if (!id_props.deviceLUIDValid) return false;
+
+    if (!id_props.deviceLUIDValid) {
+        NV3D_LOG_ERROR(L"VulkanBackend: deviceLUID not valid on physical device");
+        return false;
+    }
     static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size mismatch");
-    std::memcpy(out_luid, id_props.deviceLUID, sizeof(LUID));
+    std::memcpy(out_luid, id_props.deviceLUID, VK_LUID_SIZE);
     return true;
 }
 
@@ -100,14 +111,19 @@ bool VulkanBackend::CreateBridgeDevice(LUID adapter_luid) {
     Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> target_adapter;
-    for (UINT i = 0; ; ++i) {
+    for (UINT i = 0;; ++i) {
         Microsoft::WRL::ComPtr<IDXGIAdapter1> a;
         if (factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 d{};
         if (FAILED(a->GetDesc1(&d))) continue;
-        if (LuidsEqual(d.AdapterLuid, adapter_luid)) { target_adapter = a; break; }
+        if (LuidsEqual(d.AdapterLuid, adapter_luid)) {
+            target_adapter = a;
+            found = true;
+            NV3D_LOG_INFO(L"VulkanBackend: matched DXGI adapter at index %u", i);
+            break;
+        }
     }
-    if (!target_adapter) {
+    if (!found || !target_adapter) {
         NV3D_LOG_ERROR(L"VulkanBackend: no DXGI adapter matches Vulkan LUID");
         return false;
     }

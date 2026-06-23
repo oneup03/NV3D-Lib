@@ -100,6 +100,9 @@ struct InitParams {
     // library-owned mode (auto-minimize when the host process loses focus —
     // suitable for VR runtimes that bring their own focus management).
     DWORD tracked_game_pid = 0;
+
+    bool has_external_luid = false;
+    LUID external_luid{};
 };
 
 // -----------------------------------------------------------------------------
