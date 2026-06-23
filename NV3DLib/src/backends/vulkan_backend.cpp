@@ -66,13 +66,33 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
     return S_OK;
 }
 
-bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid)
-{
-    NV3D_LOG_INFO(L"*** HARDCODED ResolveAdapterLuid ***");
-
-    out_luid->LowPart  = 0x0066B499;
-    out_luid->HighPart = 0x00000000;
-
+bool VulkanBackend::ResolveAdapterLuid(LUID* out_luid) {
+    PFN_vkGetInstanceProcAddr getInstProcAddr = LoadVulkanLoader();
+    if (!getInstProcAddr) {
+        NV3D_LOG_ERROR(L"VulkanBackend: vulkan-1.dll not found");
+        return false;
+    }
+    auto vkGetPhysProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+        getInstProcAddr(reinterpret_cast<VkInstance>(inst_),
+                          "vkGetPhysicalDeviceProperties2"));
+    if (!vkGetPhysProps2) {
+        vkGetPhysProps2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            getInstProcAddr(reinterpret_cast<VkInstance>(inst_),
+                              "vkGetPhysicalDeviceProperties2KHR"));
+    }
+    if (!vkGetPhysProps2) {
+        NV3D_LOG_ERROR(L"VulkanBackend: vkGetPhysicalDeviceProperties2 unresolved");
+        return false;
+    }
+    VkPhysicalDeviceIDProperties id_props{};
+    id_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &id_props;
+    vkGetPhysProps2(reinterpret_cast<VkPhysicalDevice>(phys_), &props2);
+    if (!id_props.deviceLUIDValid) return false;
+    static_assert(sizeof(LUID) == VK_LUID_SIZE, "LUID size mismatch");
+    std::memcpy(out_luid, id_props.deviceLUID, sizeof(LUID));
     return true;
 }
 
