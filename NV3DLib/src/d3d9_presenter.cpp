@@ -89,6 +89,33 @@ bool D3D9Presenter::Init(PresentWindow* window, const InitParams& params) {
 void D3D9Presenter::Shutdown() {
     const bool dead = d3d9_dead_.load(std::memory_order_acquire);
 
+    // -1. If the popup is iconic (Ctrl+F8 minimized) at Shutdown start,
+    //     RESTORE it before any teardown. Releasing a D3D9Ex FSE device
+    //     whose owner window is iconic is a known driver-wedge surface:
+    //     the device is in OCCLUDED state, FSE lock is gone but the mode
+    //     list is still in FSE-mode territory, and Release on that
+    //     ambiguous state has been observed to wedge the display.
+    //     Restoring puts the device back into a clean FSE state for the
+    //     rest of teardown.
+    //
+    //     Use SetWantVisible(true) — the window thread observes the flip
+    //     and does SW_RESTORE from its own context (cross-thread
+    //     SW_RESTORE on the FSE popup is forbidden — wedges DWM). Poll
+    //     IsIconic with a 1s bounded wait so a stuck window thread
+    //     doesn't block shutdown.
+    if (!dead && window_ && window_->Hwnd() && IsIconic(window_->Hwnd())) {
+        NV3D_LOG_INFO(L"D3D9Presenter::Shutdown: popup is iconic — restoring before teardown");
+        window_->SetWantVisible(true);
+        for (int i = 0; i < 20 && IsIconic(window_->Hwnd()); ++i) {
+            Sleep(50);  // window thread polls want_visible_ every 50ms
+        }
+        if (IsIconic(window_->Hwnd())) {
+            NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: popup did not restore within 1s — proceeding anyway");
+        } else {
+            NV3D_LOG_INFO(L"D3D9Presenter::Shutdown: popup restored");
+        }
+    }
+
     // 0. Strip WS_EX_LAYERED | WS_EX_TRANSPARENT from the FSE window FIRST
     //    and let DWM settle. Doing this after the D3D9 release races with
     //    DWM's compositing state for the layered window and freezes input
