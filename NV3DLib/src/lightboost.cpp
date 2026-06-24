@@ -363,6 +363,54 @@ bool LightBoost::Enable(const std::wstring& gdi_device_w,
     cd.yRatio       = 1.0f;
     cd.depth        = 32;
 
+    // ---- Cleanup: delete any pre-existing custom-display entries that
+    // ---- match our LightBoost timing (width/height/HTotal/VTotal).
+    // Prior Save runs (now removed) inserted one entry per session with
+    // no de-duplication, so users accumulated identical entries over
+    // many runs. With duplicates present, NVCP's mode-selection logic
+    // gets confused and falls back to the EDID-default refresh rate
+    // (144 Hz on AUS_27B1) when 3D Vision activates — symptom: the
+    // panel drops out of LightBoost shortly after FSE engages, even
+    // though the trial timing is registered.
+    //
+    // Deleting matching entries here means by the time we Try below,
+    // the live trial is the ONLY entry matching the LightBoost timing.
+    // VRto3D works exactly this way (never saves, only Try) — we now
+    // catch up to that even on systems that had accumulated duplicates
+    // from prior NV3D-Glass runs.
+    //
+    // We only delete entries whose timing EXACTLY matches what we're
+    // about to Try, so user-set custom resolutions (different timing)
+    // are left untouched.
+    {
+        const NvU32 id = display_ids_.front();
+        std::vector<NV_CUSTOM_DISPLAY> to_delete;
+        for (NvU32 i = 0; ; ++i) {
+            NV_CUSTOM_DISPLAY cd_e{}; cd_e.version = NV_CUSTOM_DISPLAY_VER;
+            NvAPI_Status es = NvAPI_DISP_EnumCustomDisplay(id, i, &cd_e);
+            if (es != NVAPI_OK) break;
+            if (cd_e.width == merged.HVisible &&
+                cd_e.height == merged.VVisible &&
+                cd_e.timing.HTotal == merged.HTotal &&
+                cd_e.timing.VTotal == merged.VTotal) {
+                to_delete.push_back(cd_e);
+            }
+        }
+        for (auto& cd_e : to_delete) {
+            NvAPI_Status ds = NvAPI_DISP_DeleteCustomDisplay(
+                display_ids_.data(),
+                static_cast<NvU32>(display_ids_.size()),
+                &cd_e);
+            NV3D_LOG_INFO(L"LightBoost: deleted prior custom-display %ux%u HTotal=%u VTotal=%u s=%d",
+                           cd_e.width, cd_e.height,
+                           cd_e.timing.HTotal, cd_e.timing.VTotal, ds);
+        }
+        if (!to_delete.empty()) {
+            NV3D_LOG_INFO(L"LightBoost: cleaned up %zu duplicate custom-display entr%s",
+                           to_delete.size(), to_delete.size() == 1 ? L"y" : L"ies");
+        }
+    }
+
     std::vector<NV_CUSTOM_DISPLAY> arr{ cd };
     NvAPI_Status s = NvAPI_DISP_TryCustomDisplay(display_ids_.data(),
                                                    static_cast<NvU32>(display_ids_.size()),
@@ -379,38 +427,64 @@ bool LightBoost::Enable(const std::wstring& gdi_device_w,
     if (has_original_target_timing_)
         WaitForTimingChange(display_ids_.front(), original_target_timing_, 10000);
 
-    // Commit the validated trial timing to NVCP's persistent custom-display
-    // registry. Without this, the timing would revert on reboot (or on any
-    // RevertCustomDisplayTrial call). Saving has several payoffs:
-    //   * LightBoost stays applied across reboots — users typically want this
-    //     on their 3DV panel permanently rather than re-enabling each session.
-    //   * No modeset / flicker on host shutdown (Disable is a no-op).
-    //   * Removes the post-D3D9-release ChangeDisplaySettingsExW fallback path
-    //     that was a contributor to the post-quit display-freeze pattern.
-    // (true, true) = per-output-id + per-monitor-id, matching the NvAPI SDK
-    // CustomTiming sample's parameters. To remove the saved timing, the user
-    // can delete the entry from NVIDIA Control Panel's custom resolutions.
-    NvAPI_Status saved = NvAPI_DISP_SaveCustomDisplay(
-        display_ids_.data(),
-        static_cast<NvU32>(display_ids_.size()),
-        /*isThisOutputIdOnly=*/  TRUE,
-        /*isThisMonitorIdOnly=*/ TRUE);
-    if (saved != NVAPI_OK) {
-        NV3D_LOG_WARN(L"LightBoost: SaveCustomDisplay s=%d — timing applied for this session "
-                       L"only (will revert on reboot)", saved);
-    } else {
-        NV3D_LOG_INFO(L"LightBoost: SaveCustomDisplay OK — timing persisted to NVCP");
+    // NO SaveCustomDisplay. Match VRto3D's pattern (trial-only).
+    //
+    // The trial from TryCustomDisplay above stays live until reboot and
+    // NVCP picks it up as an available rate while it's active. Prior
+    // duplicates from old Save runs were auto-cleaned by the
+    // DeleteCustomDisplay pass before Try (above), so by this point the
+    // custom-display registry should have exactly one matching entry —
+    // the live trial.
+
+    // Final-state diagnostic: enumerate so the log shows that the
+    // registry ended up clean (1 matching entry from the live trial).
+    {
+        const NvU32 id = display_ids_.front();
+        int found = 0;
+        for (NvU32 i = 0; ; ++i) {
+            NV_CUSTOM_DISPLAY cd_e{}; cd_e.version = NV_CUSTOM_DISPLAY_VER;
+            NvAPI_Status es = NvAPI_DISP_EnumCustomDisplay(id, i, &cd_e);
+            if (es != NVAPI_OK) break;
+            ++found;
+            NV3D_LOG_INFO(L"LightBoost: post-Try registry entry index=%u  %ux%u  HTotal=%u VTotal=%u rr=%u",
+                           i,
+                           cd_e.width, cd_e.height,
+                           cd_e.timing.HTotal, cd_e.timing.VTotal, cd_e.timing.etc.rr);
+        }
+        NV3D_LOG_INFO(L"LightBoost: post-Try registry has %d custom-display entr%s for this monitor",
+                       found, found == 1 ? L"y" : L"ies");
     }
 
-    // Sync GDI's display mode to the new wire timing.
+    // Sync GDI's display mode to the new wire timing — PERSISTENTLY via
+    // CDS_UPDATEREGISTRY. This is what NVCP does when the user manually
+    // picks a refresh in its "Change resolution" dropdown: writes the
+    // selected mode to the user's display profile so it survives
+    // subsequent FSE engage/release cycles and isn't reverted when no
+    // fullscreen app is foreground.
+    //
+    // Previously we used CDS_FULLSCREEN which is a TEMPORARY change that
+    // reverts to the registry DEVMODE refresh as soon as the foreground
+    // app stops being fullscreen — symptom: panel dropped back to
+    // 144 Hz the moment Ctrl+F8 hid the popup or FSE focus shifted.
+    //
+    // Tradeoff: this leaves the user's panel persistently at the
+    // LightBoost refresh (typically 120 Hz) until they manually change
+    // it back via Windows Display Settings or NVCP. Acceptable because
+    // users running an NV3D-Glass session generally want LightBoost on;
+    // matches what they'd configure by hand in NVCP.
     if (has_original_devmode_ && matched_.refresh_int > 0) {
         DEVMODEW dm = original_devmode_;
         dm.dmDisplayFrequency = matched_.refresh_int;
         dm.dmFields |= DM_DISPLAYFREQUENCY;
         LONG rc = ChangeDisplaySettingsExW(gdi_device_w.c_str(), &dm,
-                                             nullptr, CDS_FULLSCREEN, nullptr);
-        if (rc == DISP_CHANGE_SUCCESSFUL) WaitForModesetSettle(500);
-        else NV3D_LOG_WARN(L"LightBoost: ChangeDisplaySettingsExW rc=%ld", rc);
+                                             nullptr, CDS_UPDATEREGISTRY, nullptr);
+        if (rc == DISP_CHANGE_SUCCESSFUL) {
+            WaitForModesetSettle(500);
+            NV3D_LOG_INFO(L"LightBoost: CDS_UPDATEREGISTRY OK — DEVMODE refresh persisted at %u Hz",
+                           matched_.refresh_int);
+        } else {
+            NV3D_LOG_WARN(L"LightBoost: ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY) rc=%ld", rc);
+        }
     }
 
     enabled_ = true;
