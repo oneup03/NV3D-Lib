@@ -23,6 +23,7 @@
 
 #include <wrl/client.h>
 #include <d3d11.h>
+#include <d3d11_4.h>     // ID3D11Device5 / ID3D11DeviceContext4 / ID3D11Fence
 #include <memory>
 
 namespace NV3D {
@@ -34,6 +35,7 @@ public:
     HRESULT SetInputTexture(ID3D11Texture2D* sbs_tex) override;
     HRESULT Present() override;
     void    SetVisible(bool visible) override;
+    void    SetEyeSwap(bool enable) override;
     void    Delete() override;
 
 private:
@@ -42,16 +44,26 @@ private:
     bool EnsureSyncQuery();
     HRESULT WaitForDx11Writes();
 
+    // Fence path: when supported, replaces the EVENT-query GetData spin with
+    // an ID3D11Fence + Win32 event so the wait moves entirely to the async
+    // worker. Returns true on systems with D3D11.4 (ID3D11Device5).
+    bool TryInitFencePath();
+
     InitParams params_{};
     std::unique_ptr<PresentWindow>  window_;
     std::unique_ptr<D3D9Presenter>  presenter_;
     Nv3DVisionSuppressor            suppressor_;
 
-    // SPLIT ASYNC. Only the final presenter_->Present (D3D9 StretchRect +
-    // vsync'd PresentEx) runs on the worker; the host-context CopyResource
-    // + EVENT-query sync above it stays on the caller's thread because
-    // ID3D11DeviceContext immediate contexts are not thread-safe and we
-    // can't assume the host isn't also using theirs concurrently.
+    // FULL ASYNC when ID3D11Fence is available (D3D11.4 / Win10+). The host
+    // thread runs the mirror CopyResource (brief, host-context-bound),
+    // signals an ID3D11Fence on host_ctx4_, then hands off to the worker —
+    // the worker waits on a Win32 event via fence_->SetEventOnCompletion
+    // (no host_ctx access) and only then runs the D3D9 PresentEx. Submit
+    // returns in microseconds.
+    //
+    // Fallback (no D3D11.4): SPLIT ASYNC, same as before — the host thread
+    // spins on GetData up to 500 ms before handing off. Only used on very
+    // old hardware where ID3D11Device5 isn't available.
     AsyncPresenter                  async_;
 
     Microsoft::WRL::ComPtr<ID3D11Device>        host_device_;
@@ -81,8 +93,19 @@ private:
     uint32_t shared_cache_h_     = 0;
     DXGI_FORMAT shared_cache_fmt_ = DXGI_FORMAT_UNKNOWN;
 
-    // ID3D11Query EVENT for cross-device sync.
+    // ID3D11Query EVENT for cross-device sync. Used only as a fallback when
+    // the fence path below isn't available (very old hardware).
     Microsoft::WRL::ComPtr<ID3D11Query> sync_query_;
+
+    // Fence-based sync (D3D11.4). When fence_ is non-null, Present() uses
+    // the fully-async path: Signal on host_ctx4_ then defer the wait to the
+    // worker via fence_->SetEventOnCompletion. Host thread returns to the
+    // caller in microseconds instead of spinning on GetData up to 500 ms.
+    Microsoft::WRL::ComPtr<ID3D11Device5>        host_device5_;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext4> host_ctx4_;
+    Microsoft::WRL::ComPtr<ID3D11Fence>          fence_;
+    HANDLE                                       fence_event_ = nullptr;  // auto-reset
+    uint64_t                                     fence_value_ = 0;
 };
 
 }  // namespace NV3D

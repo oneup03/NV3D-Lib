@@ -45,10 +45,44 @@ HRESULT DX11Backend::Init(ID3D11Device* device, const InitParams& params) {
 
     if (params_.enable_suppressor) suppressor_.Install();
 
-    // Split-async present worker. Only the final D3D9 Present call is
-    // moved off-thread (see Present() below for why).
+    if (TryInitFencePath()) {
+        NV3D_LOG_INFO(L"DX11Backend: full async via ID3D11Fence");
+    } else {
+        NV3D_LOG_INFO(L"DX11Backend: split async (no D3D11.4 fence) — falling back to GetData spin");
+    }
+
     async_.Start();
     return S_OK;
+}
+
+bool DX11Backend::TryInitFencePath() {
+    if (!host_device_ || !host_ctx_) return false;
+    if (FAILED(host_device_->QueryInterface(IID_PPV_ARGS(&host_device5_))) || !host_device5_) {
+        return false;
+    }
+    if (FAILED(host_ctx_->QueryInterface(IID_PPV_ARGS(&host_ctx4_))) || !host_ctx4_) {
+        host_device5_.Reset();
+        return false;
+    }
+    HRESULT hr = host_device5_->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
+    if (FAILED(hr) || !fence_) {
+        NV3D_LOG_WARN(L"DX11Backend: CreateFence failed hr=0x%08X — fence path disabled", hr);
+        host_ctx4_.Reset();
+        host_device5_.Reset();
+        return false;
+    }
+    // Auto-reset event: WaitForSingleObject returning WAIT_OBJECT_0 resets
+    // the event automatically, so the next frame starts with a clean state.
+    fence_event_ = CreateEventW(nullptr, /*manualReset=*/FALSE, /*initial=*/FALSE, nullptr);
+    if (!fence_event_) {
+        NV3D_LOG_WARN(L"DX11Backend: CreateEventW failed err=%lu — fence path disabled", GetLastError());
+        fence_.Reset();
+        host_ctx4_.Reset();
+        host_device5_.Reset();
+        return false;
+    }
+    fence_value_ = 0;
+    return true;
 }
 
 HRESULT DX11Backend::SetInputTexture(ID3D11Texture2D* sbs_tex) {
@@ -211,23 +245,54 @@ HRESULT DX11Backend::Present() {
 
     if (!EnsureSharedImport(src)) return E_FAIL;
 
-    HRESULT hr = WaitForDx11Writes();
-    if (FAILED(hr)) return hr;
-
-    // SPLIT ASYNC. Everything above this point ran on the calling thread:
-    //   - host_ctx_->CopyResource (if mirror path) — uses HOST'S immediate
-    //     context, can't move to a worker without external synchronization
-    //     because the host may also be using their context.
-    //   - WaitForDx11Writes (host_ctx_ End/Flush/GetData EVENT spin) — same
-    //     constraint; uses the host's immediate context.
-    // From here down only the D3D9Presenter is involved — that's our own
-    // device, created with D3DCREATE_MULTITHREADED, so the worker can take
-    // over the StretchRect + vsync'd PresentEx without thread-safety
-    // concerns. The vsync wait is the biggest single cost; off-loading
-    // just it captures most of the latency win.
     Microsoft::WRL::ComPtr<IDirect3DSurface9> snap_sfc = shared_d3d9_sfc_;
     const uint32_t snap_w = input_w_;
     const uint32_t snap_h = input_h_;
+
+    if (fence_ && host_ctx4_ && fence_event_) {
+        // FULL ASYNC PATH. Bump the fence value, schedule a GPU-side signal
+        // on the host context, kick it with Flush, and hand the wait off to
+        // the worker via fence_->SetEventOnCompletion. The worker uses the
+        // Win32 event from any thread without touching host_ctx_, so the
+        // calling thread returns to App::Tick in microseconds — no more
+        // up-to-500ms GetData spin.
+        const uint64_t signal_value = ++fence_value_;
+        HRESULT shr = host_ctx4_->Signal(fence_.Get(), signal_value);
+        if (FAILED(shr)) {
+            NV3D_LOG_ERROR(L"DX11Backend: ID3D11DeviceContext4::Signal failed hr=0x%08X", shr);
+            if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "fence signal");
+            return shr;
+        }
+        host_ctx_->Flush();  // make sure the signal reaches the GPU promptly
+
+        return async_.Submit([this, signal_value, snap_sfc, snap_w, snap_h]() -> HRESULT {
+            HRESULT hr = fence_->SetEventOnCompletion(signal_value, fence_event_);
+            if (FAILED(hr)) {
+                NV3D_LOG_ERROR(L"DX11Backend: SetEventOnCompletion failed hr=0x%08X", hr);
+                if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "SetEventOnCompletion");
+                return hr;
+            }
+            DWORD wait = WaitForSingleObject(fence_event_, 500);
+            if (wait == WAIT_TIMEOUT) {
+                NV3D_LOG_ERROR(L"DX11Backend: fence event timeout (>500ms) — GPU wedged?");
+                if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "fence wait timeout");
+                return E_FAIL;
+            }
+            if (wait != WAIT_OBJECT_0) {
+                NV3D_LOG_ERROR(L"DX11Backend: WaitForSingleObject(fence_event) failed result=%lu err=%lu",
+                                wait, GetLastError());
+                return E_FAIL;
+            }
+            return presenter_->Present(snap_sfc.Get(), snap_w, snap_h);
+        });
+    }
+
+    // FALLBACK PATH (very old hardware without D3D11.4). The EVENT-query
+    // GetData spin happens on the calling thread because GetData is a
+    // context method and we'd need external synchronization to move it to
+    // the worker. Bounded at 500 ms by WaitForDx11Writes.
+    HRESULT hr = WaitForDx11Writes();
+    if (FAILED(hr)) return hr;
     return async_.Submit([this, snap_sfc, snap_w, snap_h]() {
         return presenter_->Present(snap_sfc.Get(), snap_w, snap_h);
     });
@@ -235,6 +300,10 @@ HRESULT DX11Backend::Present() {
 
 void DX11Backend::SetVisible(bool visible) {
     if (window_) window_->SetWantVisible(visible);
+}
+
+void DX11Backend::SetEyeSwap(bool enable) {
+    if (presenter_) presenter_->SetEyeSwap(enable);
 }
 
 void DX11Backend::Delete() {
@@ -263,6 +332,13 @@ void DX11Backend::Delete() {
     // DX11 resources are always safe — the host's DX11 device is independent
     // of D3D9 device state.
     sync_query_.Reset();
+    fence_.Reset();
+    host_ctx4_.Reset();
+    host_device5_.Reset();
+    if (fence_event_) {
+        CloseHandle(fence_event_);
+        fence_event_ = nullptr;
+    }
     mirror_tex_.Reset();
     input_tex_.Reset();
 
