@@ -129,6 +129,11 @@ public:
     // host's other windows non-responsive.
     virtual void SetVisible(bool visible) = 0;
 
+    // Live eye-swap toggle. Updates the NV3D signature row on the next
+    // frame; the driver picks up the new routing on the following PresentEx.
+    // No teardown / re-Init needed — safe to call mid-session at any time.
+    virtual void SetEyeSwap(bool enable) = 0;
+
     // Tear down the library. Equivalent to deleting the object.
     virtual void Delete() = 0;
 

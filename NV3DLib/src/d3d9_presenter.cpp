@@ -19,6 +19,22 @@ namespace NV3D {
 
 namespace {
 
+// NV3D AUTOMATIC-mode packed-stereo signature. The NVIDIA driver scans the
+// last row of the packed surface presented to PresentEx for this marker;
+// when found, it routes the left half of the body to the left eye and the
+// right half to the right eye through the 3D Vision IR emitter.
+constexpr DWORD kNvStereoSignature = 0x4433564Eu;   // 'N','V','3','D'
+
+#pragma pack(push, 1)
+struct NvStereoImageHeader {
+    DWORD signature;
+    DWORD width;     // per-eye width
+    DWORD height;
+    DWORD bpp;       // bits per pixel
+    DWORD flags;     // 0 = normal, 1 = swap eyes
+};
+#pragma pack(pop)
+
 // SEH guard around NvAPI_Initialize so a missing nvapi64.dll (or delay-load
 // failure on non-NVIDIA systems) returns a clean error instead of crashing
 // the host. Mirrors VRto3D's TryNvAPIInitializeSEH.
@@ -78,6 +94,7 @@ D3D9Presenter::~D3D9Presenter() {
 bool D3D9Presenter::Init(PresentWindow* window, const InitParams& params) {
     window_    = window;
     params_    = params;
+    eye_swap_live_.store(params.eye_swap);
     monitor_w_ = window->Width();
     monitor_h_ = window->Height();
     activation_retries_left_ = (params.activation_retry_budget < 0)
@@ -146,14 +163,18 @@ void D3D9Presenter::Shutdown() {
     //    kernel-mode driver would block trying to flush GPU work that's
     //    already wedged.
     if (dead) {
+        (void)packed_default_.Detach();
         (void)back_buffer_.Detach();
         (void)device9_.Detach();
         (void)d3d9_.Detach();
     } else {
+        packed_default_.Reset();
         back_buffer_.Reset();
         device9_.Reset();
         d3d9_.Reset();
     }
+    packed_w_ = packed_h_ = 0;
+    sig_valid_ = false;
 
     // No LightBoost revert. Enable() commits the timing to NVCP via
     // NvAPI_DISP_SaveCustomDisplay; we deliberately leave it applied so it
@@ -171,11 +192,11 @@ void D3D9Presenter::Shutdown() {
 }
 
 bool D3D9Presenter::BuildD3D9Stack() {
-    // NvAPI must be initialised + stereo mode forced to DIRECT BEFORE the
-    // D3D9Ex device is created. The docs on NvAPI_Stereo_SetDriverMode are
-    // explicit: "This API must be called before the device is created." If
-    // we skip this the driver stays in AUTOMATIC mode and SetActiveEye is
-    // silently ignored — symptom is one-eye-only output with the emitter on.
+    // NvAPI must be initialised BEFORE the D3D9Ex device is created. We
+    // deliberately do NOT call NvAPI_Stereo_SetDriverMode here — leaving
+    // the driver in its default AUTOMATIC mode is what enables the NV3D
+    // signature scanner that consumes the magic header row we write into
+    // the packed surface every frame. See header file for the contract.
     {
         bool dll_missing = false;
         NvAPI_Status s = TryNvAPIInitializeSEH(&dll_missing);
@@ -199,15 +220,7 @@ bool D3D9Presenter::BuildD3D9Stack() {
             return false;
         }
     }
-    {
-        NvAPI_Status s = NvAPI_Stereo_SetDriverMode(NVAPI_STEREO_DRIVER_MODE_DIRECT);
-        if (s != NVAPI_OK) {
-            NV3D_LOG_WARN(L"NvAPI_Stereo_SetDriverMode(DIRECT) failed status=%d — "
-                           L"SetActiveEye routing may not work", static_cast<int>(s));
-        } else {
-            NV3D_LOG_INFO(L"D3D9Presenter: stereo driver mode = DIRECT");
-        }
-    }
+    NV3D_LOG_INFO(L"D3D9Presenter: stereo driver mode = AUTOMATIC (NV3D signature)");
 
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &d3d9_);
     if (FAILED(hr) || !d3d9_) {
@@ -302,10 +315,25 @@ bool D3D9Presenter::BuildD3D9Stack() {
     fs_mode.Format           = D3DFMT_X8R8G8B8;
     fs_mode.ScanLineOrdering = D3DSCANLINEORDERING_PROGRESSIVE;
 
-    hr = d3d9_->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, hwnd,
-                                 create_flags, &pp, &fs_mode, &device9_);
+    // CreateDeviceEx FSE retry loop. The first attempt after a GPU TDR
+    // (when the host rebuilds its D3D11 device + immediately re-Starts)
+    // frequently returns E_FAIL or DEVICELOST because the driver hasn't
+    // fully reclaimed the display for fullscreen-exclusive use yet — the
+    // user-visible symptom is "SBS in the host's control panel window"
+    // because we fall through to windowed and there's no stereo routing.
+    // Backoff retries give the driver up to ~1s to settle on its own.
+    hr = E_FAIL;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        hr = d3d9_->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, hwnd,
+                                     create_flags, &pp, &fs_mode, &device9_);
+        if (SUCCEEDED(hr) && device9_) break;
+        NV3D_LOG_INFO(L"D3D9Presenter: CreateDeviceEx FSE attempt %d/5 failed hr=0x%08X — retrying",
+                       attempt + 1, hr);
+        device9_.Reset();
+        Sleep(static_cast<DWORD>(100 * (attempt + 1)));   // 100..500 ms
+    }
     if (FAILED(hr) || !device9_) {
-        NV3D_LOG_WARN(L"CreateDeviceEx FSE failed hr=0x%08X — falling back to windowed", hr);
+        NV3D_LOG_WARN(L"CreateDeviceEx FSE failed after 5 retries hr=0x%08X — falling back to windowed", hr);
         device9_.Reset();
         fill_pp(pp, TRUE);
         hr = d3d9_->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, hwnd,
@@ -361,6 +389,75 @@ bool D3D9Presenter::BuildD3D9Stack() {
     return true;
 }
 
+bool D3D9Presenter::EnsurePackedSurface() {
+    if (!device9_) return false;
+    const uint32_t want_w = monitor_w_ * 2u;
+    const uint32_t want_h = monitor_h_;
+    if (packed_default_ && packed_w_ == want_w && packed_h_ == want_h) return true;
+
+    packed_default_.Reset();
+    sig_valid_ = false;   // surface gone → signature row needs rewriting
+
+    // Lockable so RefreshSignatureIfNeeded can LockRect+memcpy the 20-byte
+    // NV3D signature into row H. Default pool so it lives in VRAM and can
+    // be a StretchRect source/dest. +1 row of vertical height carries the
+    // signature; the body occupies rows 0..H-1.
+    HRESULT hr = device9_->CreateRenderTarget(
+        want_w, want_h + 1u,
+        D3DFMT_A8R8G8B8,
+        D3DMULTISAMPLE_NONE, 0,
+        /*Lockable=*/TRUE,
+        &packed_default_, nullptr);
+    if (FAILED(hr) || !packed_default_) {
+        NV3D_LOG_ERROR(L"D3D9Presenter: CreateRenderTarget(packed %ux%u) failed hr=0x%08X",
+                       want_w, want_h + 1u, hr);
+        CheckAndMarkD3D9Dead(hr, "CreateRenderTarget(packed)");
+        return false;
+    }
+    packed_w_ = want_w;
+    packed_h_ = want_h;
+    return true;
+}
+
+void D3D9Presenter::RefreshSignatureIfNeeded() {
+    if (!packed_default_) return;
+    const bool live_swap = eye_swap_live_.load();
+
+    if (sig_valid_ &&
+        sig_width_  == monitor_w_ &&
+        sig_height_ == monitor_h_ &&
+        sig_swap_   == live_swap) {
+        return;
+    }
+
+    NvStereoImageHeader hdr{};
+    hdr.signature = kNvStereoSignature;
+    hdr.width     = monitor_w_;
+    hdr.height    = monitor_h_;
+    hdr.bpp       = 32;
+    hdr.flags     = live_swap ? 1u : 0u;
+
+    // Header lives in the (H)th row of the packed surface. LockRect just
+    // the 5-DWORD prefix in that row — driver only inspects the first
+    // 20 bytes of the row.
+    RECT hdr_rect{ 0, static_cast<LONG>(packed_h_), 5,
+                   static_cast<LONG>(packed_h_) + 1 };
+    D3DLOCKED_RECT lr{};
+    HRESULT hr = packed_default_->LockRect(&lr, &hdr_rect, 0);
+    if (FAILED(hr)) {
+        NV3D_LOG_WARN(L"D3D9Presenter: LockRect(NV3D header row) failed hr=0x%08X", hr);
+        CheckAndMarkD3D9Dead(hr, "LockRect(NV3D header)");
+        return;
+    }
+    std::memcpy(lr.pBits, &hdr, sizeof(hdr));
+    packed_default_->UnlockRect();
+
+    sig_width_  = monitor_w_;
+    sig_height_ = monitor_h_;
+    sig_swap_   = live_swap;
+    sig_valid_  = true;
+}
+
 HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
                                  uint32_t input_w, uint32_t input_h) {
     if (d3d9_dead_.load()) return E_FAIL;
@@ -375,30 +472,38 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
         }
     }
 
-    // DIRECT mode per-eye routing.
-    const LONG eye_w = static_cast<LONG>(input_w / 2u);
-    const LONG eye_h = static_cast<LONG>(input_h);
-    RECT left_src  { 0,     0, eye_w,     eye_h };
-    RECT right_src { eye_w, 0, eye_w * 2, eye_h };
-    const RECT& src_left  = params_.eye_swap ? right_src : left_src;
-    const RECT& src_right = params_.eye_swap ? left_src  : right_src;
+    if (!EnsurePackedSurface()) return E_FAIL;
 
-    auto blit = [&](NV_STEREO_ACTIVE_EYE eye, const RECT& src, const char* eye_name) {
-        NvAPI_Stereo_SetActiveEye(stereo_handle_, eye);
-        HRESULT bhr = device9_->StretchRect(shared_input, &src,
-                                              back_buffer_.Get(), nullptr,
-                                              D3DTEXF_LINEAR);
-        if (FAILED(bhr)) {
-            NV3D_LOG_ERROR(L"StretchRect(shared->backbuf %hs) failed hr=0x%08X", eye_name, bhr);
-            CheckAndMarkD3D9Dead(bhr, "StretchRect(shared->backbuf)");
-        }
-        return bhr;
-    };
+    // Stage 1: shared input (2W_in × H_in SbS) → packed body (2W_out × H_out).
+    // LINEAR filter resamples between input and panel dimensions if they
+    // differ (e.g. producer at 3840×1080, panel at 2560×1440).
+    const RECT in_full{ 0, 0, static_cast<LONG>(input_w),  static_cast<LONG>(input_h) };
+    const RECT body{    0, 0, static_cast<LONG>(packed_w_), static_cast<LONG>(packed_h_) };
+    HRESULT hr = device9_->StretchRect(shared_input, &in_full,
+                                        packed_default_.Get(), &body,
+                                        D3DTEXF_LINEAR);
+    if (FAILED(hr)) {
+        NV3D_LOG_ERROR(L"StretchRect(shared->packed) failed hr=0x%08X", hr);
+        CheckAndMarkD3D9Dead(hr, "StretchRect(shared->packed)");
+        return hr;
+    }
 
-    HRESULT hr = blit(NVAPI_STEREO_EYE_LEFT,  src_left,  "LEFT");
-    if (FAILED(hr)) return hr;
-    hr = blit(NVAPI_STEREO_EYE_RIGHT, src_right, "RIGHT");
-    if (FAILED(hr)) return hr;
+    // Stage 2: refresh the NV3D signature row if dims or eye-swap changed.
+    // No-op in steady state.
+    RefreshSignatureIfNeeded();
+
+    // Stage 3: packed (2W × H + signature) → back buffer (W × H). The 2:1
+    // horizontal squash is what triggers the driver's signature scanner —
+    // it sees the magic header and routes left/right halves of the body
+    // to the alternate eyes instead of squashing them into one plane.
+    hr = device9_->StretchRect(packed_default_.Get(), &body,
+                                back_buffer_.Get(), nullptr,
+                                D3DTEXF_LINEAR);
+    if (FAILED(hr)) {
+        NV3D_LOG_ERROR(L"StretchRect(packed->backbuf) failed hr=0x%08X", hr);
+        CheckAndMarkD3D9Dead(hr, "StretchRect(packed->backbuf)");
+        return hr;
+    }
 
     hr = device9_->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
     if (FAILED(hr)) {
