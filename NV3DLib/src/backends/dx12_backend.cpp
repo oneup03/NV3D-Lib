@@ -62,6 +62,9 @@ HRESULT DX12Backend::Init(ID3D12Device* device, ID3D12CommandQueue* queue,
     // Spawn the async present worker. From this point on, Present() returns
     // as soon as the worker has accepted the submission — the EVENT-query
     // spin + D3D9 PresentEx vsync run on the worker thread, not the host's.
+    async_.SetOnSeh([this](DWORD /*code*/) {
+        if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "async worker SEH");
+    });
     async_.Start();
     return S_OK;
 }

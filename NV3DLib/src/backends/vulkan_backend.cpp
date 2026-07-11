@@ -62,6 +62,9 @@ HRESULT VulkanBackend::Init(NV3DVkInstance inst, NV3DVkPhysicalDevice phys,
     if (params_.enable_suppressor) suppressor_.Install();
 
     // Spawn the async present worker — same role as in DX12Backend.
+    async_.SetOnSeh([this](DWORD /*code*/) {
+        if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "async worker SEH");
+    });
     async_.Start();
     return S_OK;
 }

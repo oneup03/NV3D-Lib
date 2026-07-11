@@ -36,6 +36,7 @@ public:
     HRESULT Present() override;
     void    SetVisible(bool visible) override;
     void    SetEyeSwap(bool enable) override;
+    void    NotifyDeviceLost() override;
     void    Delete() override;
 
 private:
@@ -84,14 +85,31 @@ private:
     // our mirror. Pointer identity used to drive cache invalidation.
     ID3D11Texture2D* shared_src_ = nullptr;
 
-    // D3D9 view onto shared_src_.
-    Microsoft::WRL::ComPtr<IDirect3DTexture9>  shared_d3d9_tex_;
+    // D3D9 views of host shared textures, keyed by ID3D11Texture2D pointer
+    // identity + dims + format. Multi-slot because a ring-buffered host
+    // (NV3D-Glass rotates 3 staging textures to decouple its DX11 writes
+    // from our D3D9 reads) alternates input pointers every frame — a
+    // single-slot cache would re-open the shared handle on every Present.
+    // Slot count must be >= the host's ring depth; 4 covers ring-3 plus one
+    // transient (e.g. a mirror texture during a format fallback).
+    struct SharedImportSlot {
+        void*       src    = nullptr;
+        HANDLE      handle = nullptr;
+        uint32_t    w      = 0;
+        uint32_t    h      = 0;
+        DXGI_FORMAT fmt    = DXGI_FORMAT_UNKNOWN;
+        Microsoft::WRL::ComPtr<IDirect3DTexture9> tex;
+        Microsoft::WRL::ComPtr<IDirect3DSurface9> sfc;
+    };
+    static constexpr size_t kSharedImportSlots = 4;
+    SharedImportSlot shared_imports_[kSharedImportSlots];
+    size_t           shared_import_evict_ = 0;
+    // Current frame's view — aliases one of the slots above. Kept as a
+    // separate member so Present()'s snapshot logic stays unchanged.
     Microsoft::WRL::ComPtr<IDirect3DSurface9>  shared_d3d9_sfc_;
-    void*    shared_cache_ptr_   = nullptr;
-    HANDLE   shared_cache_handle_= nullptr;
-    uint32_t shared_cache_w_     = 0;
-    uint32_t shared_cache_h_     = 0;
-    DXGI_FORMAT shared_cache_fmt_ = DXGI_FORMAT_UNKNOWN;
+
+    // Rate limiter for the worker's GPU-stall warning (worker thread only).
+    DWORD last_stall_log_tick_ = 0;
 
     // ID3D11Query EVENT for cross-device sync. Used only as a fallback when
     // the fence path below isn't available (very old hardware).

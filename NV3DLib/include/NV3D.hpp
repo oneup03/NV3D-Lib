@@ -134,6 +134,17 @@ public:
     // No teardown / re-Init needed — safe to call mid-session at any time.
     virtual void SetEyeSwap(bool enable) = 0;
 
+    // Host-side notification that the GPU backing this interface was lost
+    // (TDR / DXGI_ERROR_DEVICE_REMOVED / _RESET observed on the host's own
+    // D3D11 device). Marks the internal D3D9 device dead so the subsequent
+    // Delete() takes the non-blocking teardown path: no Stereo_DestroyHandle,
+    // no COM Release into the kernel-mode driver (both can block indefinitely
+    // against a wedged adapter), no restore-from-iconic window dance. Call
+    // BEFORE Delete() whenever the host detects device removal itself — the
+    // library often can't tell on its own, because a hidden popup means no
+    // D3D9 call runs to observe the failure.
+    virtual void NotifyDeviceLost() = 0;
+
     // Tear down the library. Equivalent to deleting the object.
     virtual void Delete() = 0;
 

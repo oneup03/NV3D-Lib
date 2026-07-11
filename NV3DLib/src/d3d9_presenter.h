@@ -59,6 +59,15 @@ public:
     bool CheckAndMarkD3D9Dead(HRESULT hr, const char* origin);
     bool IsDead() const { return d3d9_dead_.load(); }
 
+    // Bounded wait for the D3D9 device's command stream to fully retire
+    // (D3DQUERYTYPE_EVENT spin). Used by the hide path so the FSE popup's
+    // SW_MINIMIZE — and the driver's stereo-teardown modeset it triggers —
+    // starts from a quiet pipeline instead of racing in-flight stereo blits.
+    // Only call when the async worker is known idle: with
+    // D3DCREATE_MULTITHREADED the device critical section would otherwise
+    // serialize us behind a possibly-wedged in-flight call.
+    void WaitForGpuIdle(DWORD timeout_ms);
+
     // Live toggle of the eye-swap flag. Writes to an atomic that
     // RefreshSignatureIfNeeded reads on the next frame, which causes the
     // NV3D signature row to be rewritten with the new flag — driver picks
@@ -74,6 +83,7 @@ public:
 private:
     bool BuildD3D9Stack();
     void StereoActivationRetry();
+    void StereoHealthProbe();
     bool EnsurePackedSurface();
     void RefreshSignatureIfNeeded();
 
@@ -82,7 +92,6 @@ private:
 
     Microsoft::WRL::ComPtr<IDirect3D9Ex>       d3d9_;
     Microsoft::WRL::ComPtr<IDirect3DDevice9Ex> device9_;
-    Microsoft::WRL::ComPtr<IDirect3DSurface9>  back_buffer_;
 
     // Lockable render target carrying the SbS body + NV3D signature row.
     // Dimensions: 2 * monitor_w_ × (monitor_h_ + 1). Created lazily on the
@@ -108,6 +117,12 @@ private:
     int          activation_retries_left_ = 0;
     DWORD        last_stereo_activate_tick_ = 0;
     bool         activation_summary_logged_ = false;
+
+    // 1Hz IsActivated tripwire (worker thread only). A FALSE flap right
+    // before a freeze/TDR pins the blame on the driver's periodic stereo
+    // revalidation; a clean TRUE across the incident rules it out.
+    DWORD        last_health_poll_tick_ = 0;
+    bool         health_active_last_    = true;
 
     std::atomic<bool> d3d9_dead_{false};
     int               frames_since_state_check_ = 0;

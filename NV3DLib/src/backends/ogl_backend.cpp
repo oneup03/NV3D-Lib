@@ -182,6 +182,9 @@ HRESULT OGLBackend::Init(HGLRC ctx, HDC dc, const InitParams& params) {
     // Split-async present worker (only the D3D9 Present runs off-thread —
     // the GL-interop work above it stays on the calling thread because the
     // host's GL context can only be current on one thread at a time).
+    async_.SetOnSeh([this](DWORD /*code*/) {
+        if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "async worker SEH");
+    });
     async_.Start();
     return S_OK;
 }

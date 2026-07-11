@@ -35,11 +35,12 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <cstdio>
 #include <functional>
 #include <mutex>
 #include <thread>
 #include <windows.h>
+
+#include "log.h"
 
 namespace NV3D {
 
@@ -59,9 +60,14 @@ namespace detail {
 // function's captured ComPtrs leak their refs during SEH unwind because
 // /EHsc does NOT run C++ destructors on structured-exception unwind —
 // that's a slow per-incident leak, not a crash, and it stops the host
-// process going down with the driver fault. The caller's next Submit
-// retries; if the FSE state has recovered presentation resumes, if it
-// hasn't the next attempt just returns E_FAIL the same way.
+// process going down with the driver fault.
+//
+// After the swallow, the caller (via SetOnSeh) marks its D3D9 device
+// dead. Retrying through the same driver context after an AV inside
+// nvd3dumx.dll is exactly the "swallow → next frame → GPU wedge → TDR"
+// sequence we're trying to avoid — better to force the host to rebuild
+// the device via its existing recovery path than to keep feeding a
+// poisoned context.
 inline HRESULT InvokeWithSEH(std::function<HRESULT()>& fn, DWORD* out_code = nullptr) {
     HRESULT hr = E_FAIL;
     __try {
@@ -78,13 +84,21 @@ inline HRESULT InvokeWithSEH(std::function<HRESULT()>& fn, DWORD* out_code = nul
 
 class AsyncPresenter {
 public:
-    using WorkFn = std::function<HRESULT()>;
+    using WorkFn  = std::function<HRESULT()>;
+    using OnSehFn = std::function<void(DWORD /*code*/)>;
 
     AsyncPresenter() = default;
     ~AsyncPresenter() { Stop(); }
 
     AsyncPresenter(const AsyncPresenter&) = delete;
     AsyncPresenter& operator=(const AsyncPresenter&) = delete;
+
+    // Install a callback fired from the worker thread whenever the SEH
+    // guard catches a fault inside a work item. The backend uses this to
+    // mark its D3D9 device dead so the next Submit fast-fails and the
+    // host recovery path (RecreateDevice) runs, instead of re-entering
+    // the poisoned driver context. Call before Start().
+    void SetOnSeh(OnSehFn fn) { on_seh_ = std::move(fn); }
 
     // Spawn the worker thread. No-op if already started.
     void Start() {
@@ -160,6 +174,18 @@ public:
         cv_done_.wait(lk, [&]() { return !work_pending_.load() || stop_.load(); });
     }
 
+    // Bounded variant for transition points (FSE hide). Returns true when
+    // the worker is idle, false on timeout. A worker wedged inside a driver
+    // call must not hang the host's UI thread — the caller decides whether
+    // to proceed with its transition anyway.
+    bool Drain(uint32_t timeout_ms) {
+        if (!worker_.joinable()) return true;
+        std::unique_lock<std::mutex> lk(mtx_);
+        return cv_done_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]() {
+            return !work_pending_.load() || stop_.load();
+        });
+    }
+
 private:
     void Loop() {
         while (true) {
@@ -179,10 +205,11 @@ private:
             DWORD seh_code = 0;
             HRESULT hr = detail::InvokeWithSEH(fn, &seh_code);
             if (seh_code != 0) {
-                fwprintf(stderr, L"NV3D AsyncPresenter: SEH caught in worker code=0x%08lX — "
-                                  L"D3D9/NvAPI driver fault, worker continues\n",
-                          static_cast<unsigned long>(seh_code));
-                fflush(stderr);
+                NV3D_LOG_ERROR(L"AsyncPresenter: SEH caught in worker code=0x%08lX — "
+                                L"D3D9/NvAPI driver fault; marking device dead so host "
+                                L"recovery rebuilds it before next Submit",
+                                static_cast<unsigned long>(seh_code));
+                if (on_seh_) on_seh_(seh_code);
             }
             last_result_.store(hr);
 
@@ -203,6 +230,7 @@ private:
     std::atomic<HRESULT> last_result_{S_OK};
     uint32_t submit_timeout_ms_ = 8;
     WorkFn pending_;
+    OnSehFn on_seh_;
 };
 
 }  // namespace NV3D
