@@ -130,6 +130,18 @@ void D3D9Presenter::Shutdown() {
             NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: popup did not restore within 1s — proceeding anyway");
         } else {
             NV3D_LOG_INFO(L"D3D9Presenter::Shutdown: popup restored");
+            // SW_RESTORE returns as soon as the window is non-iconic, but
+            // the driver's FSE re-engagement (modeset + stereo re-engage)
+            // is still in flight. Releasing the device mid-re-engagement
+            // shows no immediate symptom, but can leave the driver's
+            // stereo state dirty — the NEXT process to engage 3D Vision
+            // trips over it (observed: adapter reset when a fresh Geo-11
+            // producer started after a Stop-while-minimized session).
+            // Let the re-engagement land, then drain the GPU before the
+            // teardown below touches the device.
+            Sleep(400);
+            WaitForGpuIdle(250);
+            NV3D_LOG_INFO(L"D3D9Presenter::Shutdown: post-restore settle complete");
         }
     }
 
@@ -164,12 +176,10 @@ void D3D9Presenter::Shutdown() {
     //    already wedged.
     if (dead) {
         (void)packed_default_.Detach();
-        (void)back_buffer_.Detach();
         (void)device9_.Detach();
         (void)d3d9_.Detach();
     } else {
         packed_default_.Reset();
-        back_buffer_.Reset();
         device9_.Reset();
         d3d9_.Reset();
     }
@@ -221,6 +231,10 @@ bool D3D9Presenter::BuildD3D9Stack() {
         }
     }
     NV3D_LOG_INFO(L"D3D9Presenter: stereo driver mode = AUTOMATIC (NV3D signature)");
+    // Build stamp so NV3D-Glass.log self-identifies which lib mitigations
+    // were actually in the running binary — repro logs are useless without it.
+    NV3D_LOG_INFO(L"NV3DLib build r2: bbcount=3 maxlatency=1 per-frame-backbuffer "
+                  L"seh-marks-dead drain-on-hide import-cache=4 stall+stereo-health probes");
 
     HRESULT hr = Direct3DCreate9Ex(D3D_SDK_VERSION, &d3d9_);
     if (FAILED(hr) || !d3d9_) {
@@ -259,7 +273,12 @@ bool D3D9Presenter::BuildD3D9Stack() {
         pp.BackBufferWidth            = dm.Width;
         pp.BackBufferHeight           = dm.Height;
         pp.BackBufferFormat           = dm.Format;
-        pp.BackBufferCount            = 2;
+        // BackBufferCount = 3: Geo-11's nvidia_dx9 output mode explicitly
+        // forces 3 for this same legacy FSE signature path. At count 2 with
+        // DISCARD rotation the driver's stereo shadow-surface cache churns
+        // identity every present, and the ~30s stereo revalidation window
+        // becomes correspondingly fragile.
+        pp.BackBufferCount            = 3;
         pp.MultiSampleType            = D3DMULTISAMPLE_NONE;
         pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
         pp.hDeviceWindow              = hwnd;
@@ -364,8 +383,13 @@ bool D3D9Presenter::BuildD3D9Stack() {
         NV3D_LOG_ERROR(L"NvAPI_Stereo_CreateHandleFromIUnknown failed code=%d", static_cast<int>(s));
         return false;
     }
-    NvAPI_Stereo_SetSurfaceCreationMode(stereo_handle_,
-                                          NVAPI_STEREO_SURFACECREATEMODE_FORCESTEREO);
+    // Leave surface-creation mode at the driver default (AUTO). FORCESTEREO
+    // is a DIRECT-mode leftover — with the NV3D signature scanner active,
+    // the packed RT is a mono source that the driver demuxes at PresentEx.
+    // Force-stereoizing it makes the packed RT itself a stereo pair, which
+    // doubles per-frame driver allocations / copies and puts the scanner in
+    // an untested corner (mono-demux-from-stereo-source). Not required for
+    // AUTOMATIC + signature.
 
     s = NvAPI_Stereo_Activate(stereo_handle_);
     {
@@ -381,11 +405,21 @@ bool D3D9Presenter::BuildD3D9Stack() {
                        sep, conv);
     }
 
-    hr = device9_->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &back_buffer_);
-    if (FAILED(hr) || !back_buffer_) {
-        NV3D_LOG_ERROR(L"GetBackBuffer failed hr=0x%08X", hr);
-        return false;
+    // Cap queued frames at 1. During the driver's ~20-30s stereo revalidation
+    // any queued stereo blits sitting on the D3D9 engine are prime targets
+    // for the reshuffle — the shorter the queue, the smaller the window in
+    // which a queued StretchRect can be reading a backbuffer whose backing
+    // allocation just got swapped out from under it.
+    if (HRESULT lat_hr = device9_->SetMaximumFrameLatency(1); FAILED(lat_hr)) {
+        NV3D_LOG_WARN(L"D3D9Presenter: SetMaximumFrameLatency(1) failed hr=0x%08X — continuing", lat_hr);
     }
+
+    // NOTE: no cached GetBackBuffer here. The driver's periodic stereo
+    // revalidation (~20-30s) reshuffles backbuffer state; a session-cached
+    // surface pointer becomes stale across that boundary and either UM-AVs
+    // or references a freed allocation in a queued command buffer (→ TDR).
+    // Present() acquires the current backbuffer per frame — GetBackBuffer
+    // on a live swap chain is just an AddRef and is negligible.
     return true;
 }
 
@@ -496,8 +530,19 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
     // horizontal squash is what triggers the driver's signature scanner —
     // it sees the magic header and routes left/right halves of the body
     // to the alternate eyes instead of squashing them into one plane.
+    //
+    // Re-acquire the current backbuffer every frame instead of caching it
+    // in BuildD3D9Stack. See the SetMaximumFrameLatency comment there for
+    // the ~30s revalidation-vs-cached-pointer rationale.
+    Microsoft::WRL::ComPtr<IDirect3DSurface9> bb;
+    hr = device9_->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    if (FAILED(hr) || !bb) {
+        NV3D_LOG_ERROR(L"GetBackBuffer failed hr=0x%08X", hr);
+        CheckAndMarkD3D9Dead(hr, "GetBackBuffer");
+        return hr;
+    }
     hr = device9_->StretchRect(packed_default_.Get(), &body,
-                                back_buffer_.Get(), nullptr,
+                                bb.Get(), nullptr,
                                 D3DTEXF_LINEAR);
     if (FAILED(hr)) {
         NV3D_LOG_ERROR(L"StretchRect(packed->backbuf) failed hr=0x%08X", hr);
@@ -513,7 +558,46 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
     }
 
     StereoActivationRetry();
+    StereoHealthProbe();
     return S_OK;
+}
+
+void D3D9Presenter::StereoHealthProbe() {
+    if (!stereo_handle_ || !stereo_activated_) return;
+    const DWORD now = GetTickCount();
+    if (now - last_health_poll_tick_ < 1000) return;
+    last_health_poll_tick_ = now;
+
+    NvU8 active = 0;
+    NvAPI_Stereo_IsActivated(stereo_handle_, &active);
+    const bool is_active = (active != 0);
+    if (is_active != health_active_last_) {
+        if (!is_active) {
+            NV3D_LOG_WARN(L"D3D9Presenter: stereo health — IsActivated flipped FALSE "
+                          L"(driver stereo revalidation / state loss in progress)");
+        } else {
+            NV3D_LOG_INFO(L"D3D9Presenter: stereo health — IsActivated recovered to TRUE");
+        }
+        health_active_last_ = is_active;
+    }
+}
+
+void D3D9Presenter::WaitForGpuIdle(DWORD timeout_ms) {
+    if (!device9_ || d3d9_dead_.load()) return;
+    Microsoft::WRL::ComPtr<IDirect3DQuery9> q;
+    if (FAILED(device9_->CreateQuery(D3DQUERYTYPE_EVENT, &q)) || !q) return;
+    q->Issue(D3DISSUE_END);
+    const DWORD t0 = GetTickCount();
+    // S_FALSE = still in flight; anything else (S_OK or a device error)
+    // ends the wait — errors are picked up by the next Present's own checks.
+    while (q->GetData(nullptr, 0, D3DGETDATA_FLUSH) == S_FALSE) {
+        if (GetTickCount() - t0 >= timeout_ms) {
+            NV3D_LOG_WARN(L"D3D9Presenter: WaitForGpuIdle timed out after %lums — proceeding",
+                          static_cast<unsigned long>(timeout_ms));
+            return;
+        }
+        Sleep(1);
+    }
 }
 
 void D3D9Presenter::StereoActivationRetry() {

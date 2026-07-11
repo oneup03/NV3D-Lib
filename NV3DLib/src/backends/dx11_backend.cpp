@@ -51,6 +51,9 @@ HRESULT DX11Backend::Init(ID3D11Device* device, const InitParams& params) {
         NV3D_LOG_INFO(L"DX11Backend: split async (no D3D11.4 fence) — falling back to GetData spin");
     }
 
+    async_.SetOnSeh([this](DWORD /*code*/) {
+        if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "async worker SEH");
+    });
     async_.Start();
     return S_OK;
 }
@@ -134,14 +137,14 @@ bool DX11Backend::EnsureSharedImport(ID3D11Texture2D* src) {
 
     D3D11_TEXTURE2D_DESC td{};
     src->GetDesc(&td);
-    if (shared_d3d9_sfc_ && shared_cache_ptr_ == src &&
-        shared_cache_w_ == td.Width && shared_cache_h_ == td.Height &&
-        shared_cache_fmt_ == td.Format) {
-        return true;
-    }
 
-    shared_d3d9_sfc_.Reset();
-    shared_d3d9_tex_.Reset();
+    for (auto& slot : shared_imports_) {
+        if (slot.sfc && slot.src == src &&
+            slot.w == td.Width && slot.h == td.Height && slot.fmt == td.Format) {
+            shared_d3d9_sfc_ = slot.sfc;
+            return true;
+        }
+    }
 
     if ((td.MiscFlags & D3D11_RESOURCE_MISC_SHARED) == 0) {
         NV3D_LOG_ERROR(L"DX11Backend: source lacks MISC_SHARED — internal bug");
@@ -161,29 +164,41 @@ bool DX11Backend::EnsureSharedImport(ID3D11Texture2D* src) {
         return false;
     }
 
+    Microsoft::WRL::ComPtr<IDirect3DTexture9> tex9;
     hr = presenter_->Device()->CreateTexture(
         td.Width, td.Height, 1,
         D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
-        &shared_d3d9_tex_, &h);
-    if (FAILED(hr) || !shared_d3d9_tex_) {
+        &tex9, &h);
+    if (FAILED(hr) || !tex9) {
         NV3D_LOG_ERROR(L"DX11Backend: D3D9 CreateTexture(pSharedHandle) failed hr=0x%08X "
                         L"dims=%ux%u (adapter mismatch?)", hr, td.Width, td.Height);
         return false;
     }
-    hr = shared_d3d9_tex_->GetSurfaceLevel(0, &shared_d3d9_sfc_);
-    if (FAILED(hr) || !shared_d3d9_sfc_) {
+    Microsoft::WRL::ComPtr<IDirect3DSurface9> sfc9;
+    hr = tex9->GetSurfaceLevel(0, &sfc9);
+    if (FAILED(hr) || !sfc9) {
         NV3D_LOG_ERROR(L"DX11Backend: GetSurfaceLevel(0) failed hr=0x%08X", hr);
-        shared_d3d9_tex_.Reset();
         return false;
     }
 
-    shared_cache_ptr_   = src;
-    shared_cache_handle_= h;
-    shared_cache_w_     = td.Width;
-    shared_cache_h_     = td.Height;
-    shared_cache_fmt_   = td.Format;
-    NV3D_LOG_INFO(L"DX11Backend: shared D3D9 view imported %ux%u handle=%p",
-                    td.Width, td.Height, h);
+    // Round-robin eviction. The evicted slot's view may still be captured
+    // by an in-flight worker lambda (snap_sfc holds its own ref), so the
+    // assignment only drops OUR ref — the object lives until the last user
+    // releases it.
+    SharedImportSlot& slot = shared_imports_[shared_import_evict_];
+    const size_t slot_idx  = shared_import_evict_;
+    shared_import_evict_   = (shared_import_evict_ + 1) % kSharedImportSlots;
+    slot        = SharedImportSlot{};
+    slot.src    = src;
+    slot.handle = h;
+    slot.w      = td.Width;
+    slot.h      = td.Height;
+    slot.fmt    = td.Format;
+    slot.tex    = std::move(tex9);
+    slot.sfc    = sfc9;
+    shared_d3d9_sfc_ = std::move(sfc9);
+    NV3D_LOG_INFO(L"DX11Backend: shared D3D9 view imported %ux%u handle=%p (slot %zu)",
+                    td.Width, td.Height, h, slot_idx);
     return true;
 }
 
@@ -272,7 +287,19 @@ HRESULT DX11Backend::Present() {
                 if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "SetEventOnCompletion");
                 return hr;
             }
+            const DWORD wait_t0 = GetTickCount();
             DWORD wait = WaitForSingleObject(fence_event_, 500);
+            const DWORD wait_ms = GetTickCount() - wait_t0;
+            // GPU-stall probe: normal fence waits at 90-120fps are 0-10ms.
+            // A spike here means the GPU itself stalled — if the host's log
+            // shows a producer frame gap in the same window, the stall was
+            // device-wide (driver), not a game hitch. Rate-limited to one
+            // line per 2s so a long stall doesn't spam.
+            if (wait_ms >= 50 && GetTickCount() - last_stall_log_tick_ >= 2000) {
+                last_stall_log_tick_ = GetTickCount();
+                NV3D_LOG_WARN(L"DX11Backend: GPU stall — fence wait took %lums",
+                              static_cast<unsigned long>(wait_ms));
+            }
             if (wait == WAIT_TIMEOUT) {
                 NV3D_LOG_ERROR(L"DX11Backend: fence event timeout (>500ms) — GPU wedged?");
                 if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEHUNG, "fence wait timeout");
@@ -299,11 +326,34 @@ HRESULT DX11Backend::Present() {
 }
 
 void DX11Backend::SetVisible(bool visible) {
+    if (!visible) {
+        // Hide = the window thread will SW_MINIMIZE the FSE popup within
+        // ~50ms, and the driver runs its stereo-teardown modeset on that
+        // transition. Make sure no stereo present races it: drain the
+        // worker's in-flight item (bounded — a worker wedged inside a
+        // driver call must not hang the host's UI thread), then wait for
+        // the D3D9 command stream to retire. A present racing the
+        // FSE→iconic transition is survivable on a healthy driver but has
+        // been observed to TDR one that is already half-wedged.
+        const bool drained = async_.Drain(750u);
+        if (!drained) {
+            NV3D_LOG_WARN(L"DX11Backend: SetVisible(false) — worker still busy after "
+                          L"750ms; skipping GPU-idle wait, minimizing anyway");
+        } else if (presenter_) {
+            presenter_->WaitForGpuIdle(250);
+        }
+    }
     if (window_) window_->SetWantVisible(visible);
 }
 
 void DX11Backend::SetEyeSwap(bool enable) {
     if (presenter_) presenter_->SetEyeSwap(enable);
+}
+
+void DX11Backend::NotifyDeviceLost() {
+    NV3D_LOG_WARN(L"DX11Backend: host reports D3D11 device lost — marking D3D9 dead "
+                  L"so teardown takes the non-blocking path");
+    if (presenter_) presenter_->CheckAndMarkD3D9Dead(D3DERR_DEVICEREMOVED, "host NotifyDeviceLost");
 }
 
 void DX11Backend::Delete() {
@@ -324,10 +374,15 @@ void DX11Backend::Delete() {
     const bool dead = presenter_ && presenter_->IsDead();
     if (dead) {
         (void)shared_d3d9_sfc_.Detach();
-        (void)shared_d3d9_tex_.Detach();
+        for (auto& slot : shared_imports_) {
+            (void)slot.sfc.Detach();
+            (void)slot.tex.Detach();
+        }
     } else {
         shared_d3d9_sfc_.Reset();
-        shared_d3d9_tex_.Reset();
+        for (auto& slot : shared_imports_) {
+            slot = SharedImportSlot{};
+        }
     }
     // DX11 resources are always safe — the host's DX11 device is independent
     // of D3D9 device state.
