@@ -155,13 +155,33 @@ void D3D9Presenter::Shutdown() {
         window_->RemoveClickThrough();
     }
 
+    // 0.5 Live path: retire our own pending GPU work before touching the
+    //     stereo handle. The iconic-restore path above already drains, but
+    //     the plain visible path used to go straight from the DWM settle
+    //     into Stereo_DestroyHandle + Release. Observed: with a producer
+    //     game dying at the same moment (driver busy reclaiming its GPU
+    //     context), that release sequence stalled ~1.8s — and the session
+    //     ended in a hard display freeze at process teardown. A drained
+    //     command stream shrinks what DestroyHandle/Release have to flush
+    //     while the driver is distracted.
+    if (!dead) {
+        WaitForGpuIdle(250);
+    }
+
     // 1. NvAPI stereo handle.
     //    Skipping DestroyHandle on a dead device is intentional — that call
     //    can block in the kernel-mode driver waiting for GPU work that will
     //    never complete. NvAPI cleans up on Unload anyway.
     if (stereo_handle_) {
         if (!dead) {
+            const DWORD t0 = GetTickCount();
             NvAPI_Stereo_DestroyHandle(stereo_handle_);
+            const DWORD ms = GetTickCount() - t0;
+            if (ms > 100) {
+                NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: Stereo_DestroyHandle took %lums "
+                              L"— driver strained; expect trouble at process teardown",
+                              static_cast<unsigned long>(ms));
+            }
         } else {
             NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: skipping Stereo_DestroyHandle (device dead)");
         }
@@ -179,9 +199,16 @@ void D3D9Presenter::Shutdown() {
         (void)device9_.Detach();
         (void)d3d9_.Detach();
     } else {
+        const DWORD t0 = GetTickCount();
         packed_default_.Reset();
         device9_.Reset();
         d3d9_.Reset();
+        const DWORD ms = GetTickCount() - t0;
+        if (ms > 100) {
+            NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: D3D9 device release took %lums "
+                          L"— driver strained; expect trouble at process teardown",
+                          static_cast<unsigned long>(ms));
+        }
     }
     packed_w_ = packed_h_ = 0;
     sig_valid_ = false;
@@ -198,7 +225,16 @@ void D3D9Presenter::Shutdown() {
     // even on the dead-device path (NvAPI cleans up the leaked stereo handle
     // here). NvAPI is reference-counted process-wide, so this only fully
     // disables NVAPI when our Initialize was the last live ref.
-    NvAPI_Unload();
+    {
+        const DWORD t0 = GetTickCount();
+        NvAPI_Unload();
+        const DWORD ms = GetTickCount() - t0;
+        if (ms > 100) {
+            NV3D_LOG_WARN(L"D3D9Presenter::Shutdown: NvAPI_Unload took %lums "
+                          L"— driver strained; expect trouble at process teardown",
+                          static_cast<unsigned long>(ms));
+        }
+    }
 }
 
 bool D3D9Presenter::BuildD3D9Stack() {
