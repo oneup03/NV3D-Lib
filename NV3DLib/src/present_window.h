@@ -73,6 +73,17 @@ public:
     // mode.
     void ApplyClickThrough();
 
+    // Toggle the popup between interactive (solid to mouse input) and
+    // click-through, for a host UI composited into the frame (e.g. an OSD).
+    // interactive=true clears WS_EX_TRANSPARENT and stops the WM_NCHITTEST →
+    // HTTRANSPARENT path so clicks land on the popup instead of the app
+    // beneath; false restores both. Deliberately leaves WS_EX_LAYERED alone
+    // (toggling it races D3D9 present — see RemoveClickThrough) and does NO
+    // DWM settle, so it's cheap enough to call on every menu open/close.
+    // The click_through_ atomic is read live by the WndProc, so this is safe
+    // to call from any thread. No-op before the window exists.
+    void SetInteractive(bool interactive);
+
     // Inverse of ApplyClickThrough — strip WS_EX_LAYERED | WS_EX_TRANSPARENT
     // and pump messages so DWM processes the style change before the D3D9Ex
     // device tears down. Without this settle step, the DWM's internal

@@ -36,6 +36,8 @@ public:
     HRESULT Present() override;
     void    SetVisible(bool visible) override;
     void    SetEyeSwap(bool enable) override;
+    void    SetInteractive(bool interactive) override;
+    HWND    GetWindowHandle() const override;
     void    NotifyDeviceLost() override;
     void    Delete() override;
 

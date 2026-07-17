@@ -350,6 +350,14 @@ void DX11Backend::SetEyeSwap(bool enable) {
     if (presenter_) presenter_->SetEyeSwap(enable);
 }
 
+void DX11Backend::SetInteractive(bool interactive) {
+    if (window_) window_->SetInteractive(interactive);
+}
+
+HWND DX11Backend::GetWindowHandle() const {
+    return window_ ? window_->Hwnd() : nullptr;
+}
+
 void DX11Backend::NotifyDeviceLost() {
     NV3D_LOG_WARN(L"DX11Backend: host reports D3D11 device lost — marking D3D9 dead "
                   L"so teardown takes the non-blocking path");
