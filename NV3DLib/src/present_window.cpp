@@ -209,6 +209,24 @@ void PresentWindow::RemoveClickThrough() {
     NV3D_LOG_INFO(L"PresentWindow: DWM settle complete after click-through removal");
 }
 
+void PresentWindow::SetInteractive(bool interactive) {
+    if (!hwnd_) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    if (interactive) {
+        // Solid: clear WS_EX_TRANSPARENT (OS hit-testing lands on us, not the
+        // window beneath) and disable the WndProc HTTRANSPARENT path. Keep
+        // WS_EX_LAYERED so DWM doesn't rebuild the layered surface (which can
+        // race D3D9 present). No DWM settle — this is a fast, frequent toggle.
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex & ~WS_EX_TRANSPARENT);
+        click_through_.store(false, std::memory_order_relaxed);
+        NV3D_LOG_INFO(L"PresentWindow: SetInteractive(true) — popup solid");
+    } else {
+        SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex | WS_EX_TRANSPARENT);
+        click_through_.store(true, std::memory_order_relaxed);
+        NV3D_LOG_INFO(L"PresentWindow: SetInteractive(false) — popup click-through");
+    }
+}
+
 void PresentWindow::ApplyClickThrough() {
     if (!hwnd_) return;
     // WS_EX_LAYERED + WS_EX_TRANSPARENT — VRto3D's exact pattern from

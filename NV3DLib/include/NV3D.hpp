@@ -134,6 +134,26 @@ public:
     // No teardown / re-Init needed — safe to call mid-session at any time.
     virtual void SetEyeSwap(bool enable) = 0;
 
+    // Toggle whether the library-owned popup is interactive (solid to mouse
+    // input) or click-through. After Init the popup is click-through: clicks
+    // fall through to whatever is behind it (WS_EX_TRANSPARENT + a
+    // WM_NCHITTEST→HTTRANSPARENT WndProc path). Pass true while the host shows
+    // an in-popup UI (e.g. an OSD/menu composited into the SbS frame) so
+    // clicks land on the popup instead of the app beneath, and false to
+    // restore click-through. Only WS_EX_TRANSPARENT + the hit-test path are
+    // touched (never WS_EX_LAYERED, which would race D3D9 present), and there
+    // is no DWM settle, so it is cheap enough to toggle on every menu
+    // open/close. Only meaningful in library-owned window mode
+    // (host_hwnd == nullptr). Safe to call from any thread.
+    virtual void SetInteractive(bool interactive) = 0;
+
+    // The library-owned FSE popup's HWND (or the host HWND in host_hwnd mode).
+    // Valid once CreateInterfaceDX11 returns success. The host may use it to
+    // map screen cursor coordinates into the popup's client area (e.g. for an
+    // OSD hit-test). Do not destroy or re-style it — the library owns its
+    // lifetime and its FSE / click-through state.
+    virtual HWND GetWindowHandle() const = 0;
+
     // Host-side notification that the GPU backing this interface was lost
     // (TDR / DXGI_ERROR_DEVICE_REMOVED / _RESET observed on the host's own
     // D3D11 device). Marks the internal D3D9 device dead so the subsequent
