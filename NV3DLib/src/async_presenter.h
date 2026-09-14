@@ -35,6 +35,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -106,19 +107,58 @@ public:
         stop_.store(false);
         work_pending_.store(false);
         last_result_.store(S_OK);
+        // Idle event — manual-reset, created SIGNALLED so the host's very
+        // first frame of a session can submit immediately. Reset the moment
+        // a work item is accepted, set again when the worker finishes it.
+        // A host that paces off this handle submits exactly one frame per
+        // completed present: no over-submission, no drops, and no blocking
+        // wait inside Submit(). See PresentDoneEvent().
+        if (!present_done_) {
+            present_done_ = CreateEventW(nullptr, /*manualReset=*/TRUE,
+                                         /*initial=*/TRUE, nullptr);
+            if (!present_done_) {
+                NV3D_LOG_WARN(L"AsyncPresenter: CreateEventW(present_done) failed err=%lu — "
+                              L"host falls back to timer pacing",
+                              GetLastError());
+            }
+        }
         worker_ = std::thread([this]() { Loop(); });
     }
+
+    // Manual-reset event that is SET whenever the worker is idle and RESET
+    // while a work item is in flight. Null if creation failed or Start()
+    // hasn't run. The host may wait on it (e.g. in
+    // MsgWaitForMultipleObjectsEx) to clock its capture/submit loop off the
+    // display instead of a wall-clock timer. Do not close it; the handle is
+    // owned by this object and released in Stop().
+    HANDLE PresentDoneEvent() const { return present_done_; }
+
+    // True while a work item is in flight. Cheap, lock-free companion to
+    // PresentDoneEvent() for callers that want to poll rather than wait.
+    bool IsBusy() const { return work_pending_.load(); }
 
     // Drain the in-flight work (if any), signal the worker to exit, join.
     // Safe to call multiple times.
     void Stop() {
-        if (!worker_.joinable()) return;
-        {
-            std::lock_guard<std::mutex> lk(mtx_);
-            stop_.store(true);
+        if (worker_.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                stop_.store(true);
+            }
+            cv_work_.notify_all();
+            worker_.join();
         }
-        cv_work_.notify_all();
-        worker_.join();
+        // Release the idle event unconditionally (not under the joinable
+        // check) so a double Stop — an explicit call followed by the
+        // destructor's — can't leak the handle. Set it first: a host
+        // blocked on it must wake and observe the teardown rather than
+        // wait out its timeout. The host waits on this handle from the
+        // same thread that drives teardown, so it cannot be mid-wait here.
+        if (present_done_) {
+            SetEvent(present_done_);
+            CloseHandle(present_done_);
+            present_done_ = nullptr;
+        }
     }
 
     // Submit a work item.
@@ -150,13 +190,37 @@ public:
         if (stop_.load()) return E_FAIL;
         if (!ready) {
             // Worker still busy — drop this frame.
+            stat_dropped_.fetch_add(1, std::memory_order_relaxed);
             return last_result_.load();
         }
         pending_ = std::move(fn);
         work_pending_.store(true);
+        // Busy from here until Loop() finishes the item. Reset under the
+        // lock so the flag and the event can never disagree.
+        if (present_done_) ResetEvent(present_done_);
+        stat_accepted_.fetch_add(1, std::memory_order_relaxed);
         lk.unlock();
         cv_work_.notify_one();
         return last_result_.load();
+    }
+
+    // Snapshot the present-path counters and reset them. Host-side pacing
+    // diagnostics only — call at most ~1 Hz. present_ms_* cover the whole
+    // work item (fence wait + D3D9 StretchRects + the vsync-blocked
+    // PresentEx), which is the number that tells you what the display
+    // cadence actually is.
+    void TakeStats(uint32_t* accepted, uint32_t* dropped, uint32_t* done,
+                   float* ms_avg, float* ms_max) {
+        const uint32_t a = stat_accepted_.exchange(0, std::memory_order_relaxed);
+        const uint32_t d = stat_dropped_.exchange(0, std::memory_order_relaxed);
+        const uint32_t n = stat_done_.exchange(0, std::memory_order_relaxed);
+        const uint64_t us_sum = stat_us_sum_.exchange(0, std::memory_order_relaxed);
+        const uint64_t us_max = stat_us_max_.exchange(0, std::memory_order_relaxed);
+        if (accepted) *accepted = a;
+        if (dropped)  *dropped  = d;
+        if (done)     *done     = n;
+        if (ms_avg)   *ms_avg   = n ? static_cast<float>(us_sum) / n / 1000.0f : 0.0f;
+        if (ms_max)   *ms_max   = static_cast<float>(us_max) / 1000.0f;
     }
 
     // Tune the submit timeout (ms). Default 8ms ≈ half a frame at 60Hz —
@@ -203,7 +267,10 @@ private:
             // instead of terminating the host process. See the comment
             // on detail::InvokeWithSEH for the gory details.
             DWORD seh_code = 0;
+            LARGE_INTEGER t0{};
+            QueryPerformanceCounter(&t0);
             HRESULT hr = detail::InvokeWithSEH(fn, &seh_code);
+            RecordPresentDuration(t0);
             if (seh_code != 0) {
                 NV3D_LOG_ERROR(L"AsyncPresenter: SEH caught in worker code=0x%08lX — "
                                 L"D3D9/NvAPI driver fault; marking device dead so host "
@@ -216,8 +283,32 @@ private:
             {
                 std::lock_guard<std::mutex> lk(mtx_);
                 work_pending_.store(false);
+                // Idle again — wake a host that is pacing off this handle.
+                // Inside the lock so it stays paired with work_pending_.
+                if (present_done_) SetEvent(present_done_);
             }
             cv_done_.notify_one();
+        }
+    }
+
+    // Accumulate one completed work item's wall time into the stat
+    // counters. Worker thread only.
+    void RecordPresentDuration(const LARGE_INTEGER& t0) {
+        static const long long freq = []() {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            return f.QuadPart ? f.QuadPart : 1;
+        }();
+        LARGE_INTEGER t1{};
+        QueryPerformanceCounter(&t1);
+        const long long ticks = t1.QuadPart - t0.QuadPart;
+        if (ticks <= 0) return;
+        const uint64_t us = static_cast<uint64_t>((ticks * 1000000LL) / freq);
+        stat_done_.fetch_add(1, std::memory_order_relaxed);
+        stat_us_sum_.fetch_add(us, std::memory_order_relaxed);
+        uint64_t prev = stat_us_max_.load(std::memory_order_relaxed);
+        while (us > prev &&
+               !stat_us_max_.compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
         }
     }
 
@@ -231,6 +322,19 @@ private:
     uint32_t submit_timeout_ms_ = 8;
     WorkFn pending_;
     OnSehFn on_seh_;
+
+    // Set while idle, reset while a work item is in flight. See
+    // PresentDoneEvent(); owned here, released in Stop().
+    HANDLE present_done_ = nullptr;
+
+    // Present-path telemetry, drained by TakeStats(). Relaxed ordering
+    // throughout: these are counters for a once-per-second log line, never
+    // control flow.
+    std::atomic<uint32_t> stat_accepted_{0};
+    std::atomic<uint32_t> stat_dropped_{0};
+    std::atomic<uint32_t> stat_done_{0};
+    std::atomic<uint64_t> stat_us_sum_{0};
+    std::atomic<uint64_t> stat_us_max_{0};
 };
 
 }  // namespace NV3D

@@ -25,6 +25,24 @@ namespace {
 // right half to the right eye through the 3D Vision IR emitter.
 constexpr DWORD kNvStereoSignature = 0x4433564Eu;   // 'N','V','3','D'
 
+UINT IntervalToD3D(PresentInterval pi) {
+    switch (pi) {
+        case PresentInterval::VsyncOff: return D3DPRESENT_INTERVAL_IMMEDIATE;
+        case PresentInterval::Half:     return D3DPRESENT_INTERVAL_TWO;
+        case PresentInterval::VsyncOn:
+        default:                        return D3DPRESENT_INTERVAL_ONE;
+    }
+}
+
+const wchar_t* IntervalName(PresentInterval pi) {
+    switch (pi) {
+        case PresentInterval::VsyncOff: return L"vsync-off (immediate)";
+        case PresentInterval::Half:     return L"half (interval 2)";
+        case PresentInterval::VsyncOn:
+        default:                        return L"vsync-on (interval 1)";
+    }
+}
+
 #pragma pack(push, 1)
 struct NvStereoImageHeader {
     DWORD signature;
@@ -316,13 +334,14 @@ bool D3D9Presenter::BuildD3D9Stack() {
         // becomes correspondingly fragile.
         pp.BackBufferCount            = 3;
         pp.MultiSampleType            = D3DMULTISAMPLE_NONE;
-        pp.SwapEffect                 = D3DSWAPEFFECT_DISCARD;
+        pp.SwapEffect                 = flipex_active_ ? D3DSWAPEFFECT_FLIPEX
+                                                       : D3DSWAPEFFECT_DISCARD;
         pp.hDeviceWindow              = hwnd;
         pp.Windowed                   = windowed;
         pp.EnableAutoDepthStencil     = FALSE;
         pp.Flags                      = 0;
         pp.FullScreen_RefreshRateInHz = windowed ? 0 : dm.RefreshRate;
-        pp.PresentationInterval       = D3DPRESENT_INTERVAL_ONE;
+        pp.PresentationInterval       = IntervalToD3D(params_.present_interval);
     };
 
     // D3DCREATE_NOWINDOWCHANGES: tells D3D9 to NOT auto-handle window-state
@@ -360,6 +379,7 @@ bool D3D9Presenter::BuildD3D9Stack() {
     PumpMessages(3);
 
     D3DPRESENT_PARAMETERS pp{};
+    flipex_active_ = params_.use_flipex;
     fill_pp(pp, FALSE);
 
     D3DDISPLAYMODEEX fs_mode{};
@@ -377,16 +397,35 @@ bool D3D9Presenter::BuildD3D9Stack() {
     // user-visible symptom is "SBS in the host's control panel window"
     // because we fall through to windowed and there's no stereo routing.
     // Backoff retries give the driver up to ~1s to settle on its own.
-    hr = E_FAIL;
-    for (int attempt = 0; attempt < 5; ++attempt) {
-        hr = d3d9_->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, hwnd,
-                                     create_flags, &pp, &fs_mode, &device9_);
-        if (SUCCEEDED(hr) && device9_) break;
-        NV3D_LOG_INFO(L"D3D9Presenter: CreateDeviceEx FSE attempt %d/5 failed hr=0x%08X — retrying",
-                       attempt + 1, hr);
+    auto try_create_fse = [&]() -> HRESULT {
+        HRESULT rc = E_FAIL;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            rc = d3d9_->CreateDeviceEx(adapter, D3DDEVTYPE_HAL, hwnd,
+                                         create_flags, &pp, &fs_mode, &device9_);
+            if (SUCCEEDED(rc) && device9_) break;
+            NV3D_LOG_INFO(L"D3D9Presenter: CreateDeviceEx FSE attempt %d/5 failed hr=0x%08X — retrying",
+                           attempt + 1, rc);
+            device9_.Reset();
+            Sleep(static_cast<DWORD>(100 * (attempt + 1)));   // 100..500 ms
+        }
+        return rc;
+    };
+
+    hr = try_create_fse();
+
+    // The experimental FLIPEX chain is not worth losing fullscreen-exclusive
+    // over: FSE is what gives us the stereo scan-out at all, FLIPEX is only a
+    // latency experiment. If the driver refused it, drop back to the stock
+    // DISCARD chain and try FSE again before considering the windowed path.
+    if ((FAILED(hr) || !device9_) && flipex_active_) {
+        NV3D_LOG_WARN(L"D3D9Presenter: FLIPEX swap chain refused (hr=0x%08X) — "
+                       L"retrying FSE with D3DSWAPEFFECT_DISCARD", hr);
+        flipex_active_ = false;
         device9_.Reset();
-        Sleep(static_cast<DWORD>(100 * (attempt + 1)));   // 100..500 ms
+        fill_pp(pp, FALSE);
+        hr = try_create_fse();
     }
+
     if (FAILED(hr) || !device9_) {
         NV3D_LOG_WARN(L"CreateDeviceEx FSE failed after 5 retries hr=0x%08X — falling back to windowed", hr);
         device9_.Reset();
@@ -444,9 +483,18 @@ bool D3D9Presenter::BuildD3D9Stack() {
     // for the reshuffle — the shorter the queue, the smaller the window in
     // which a queued StretchRect can be reading a backbuffer whose backing
     // allocation just got swapped out from under it.
-    if (HRESULT lat_hr = device9_->SetMaximumFrameLatency(1); FAILED(lat_hr)) {
-        NV3D_LOG_WARN(L"D3D9Presenter: SetMaximumFrameLatency(1) failed hr=0x%08X — continuing", lat_hr);
+    if (params_.max_frame_latency > 0) {
+        if (HRESULT lat_hr = device9_->SetMaximumFrameLatency(params_.max_frame_latency);
+            FAILED(lat_hr)) {
+            NV3D_LOG_WARN(L"D3D9Presenter: SetMaximumFrameLatency(%u) failed hr=0x%08X — continuing",
+                           params_.max_frame_latency, lat_hr);
+        }
     }
+
+    NV3D_LOG_INFO(L"D3D9Presenter: present config — interval=%s swap=%s max_frame_latency=%u",
+                   IntervalName(params_.present_interval),
+                   flipex_active_ ? L"FLIPEX" : L"DISCARD",
+                   params_.max_frame_latency);
 
     // NOTE: no cached GetBackBuffer here. The driver's periodic stereo
     // revalidation (~20-30s) reshuffles backbuffer state; a session-cached
@@ -584,7 +632,24 @@ HRESULT D3D9Presenter::Present(IDirect3DSurface9* shared_input,
         return hr;
     }
 
-    hr = device9_->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    // D3DPRESENT_FORCEIMMEDIATE overrides the chain's presentation interval
+    // for this one present. It is ONLY legal on a FLIPEX chain, so it rides
+    // along with the experiment and only when the caller asked for
+    // unthrottled presents anyway. If a driver rejects the combination,
+    // latch it off and carry on with a plain present rather than failing the
+    // frame - this is an experiment, not something worth killing output for.
+    DWORD present_flags = 0;
+    if (flipex_active_ && !force_immediate_unsupported_ &&
+        params_.present_interval == PresentInterval::VsyncOff) {
+        present_flags = D3DPRESENT_FORCEIMMEDIATE;
+    }
+    hr = device9_->PresentEx(nullptr, nullptr, nullptr, nullptr, present_flags);
+    if (hr == D3DERR_INVALIDCALL && present_flags != 0) {
+        NV3D_LOG_WARN(L"D3D9Presenter: PresentEx rejected D3DPRESENT_FORCEIMMEDIATE — "
+                       L"disabling it for this session");
+        force_immediate_unsupported_ = true;
+        hr = device9_->PresentEx(nullptr, nullptr, nullptr, nullptr, 0);
+    }
     if (FAILED(hr)) {
         NV3D_LOG_ERROR(L"PresentEx failed hr=0x%08X", hr);
         CheckAndMarkD3D9Dead(hr, "PresentEx");

@@ -109,6 +109,14 @@ private:
 
     uint32_t monitor_w_ = 0;
     uint32_t monitor_h_ = 0;
+    // Whether the swap chain actually ended up on D3DSWAPEFFECT_FLIPEX.
+    // Starts as params_.use_flipex and is cleared if the driver refused it
+    // (see BuildD3D9Stack), so Present() can't pass a FLIPEX-only present
+    // flag on a DISCARD chain.
+    bool     flipex_active_ = false;
+    // Latched when a driver rejects D3DPRESENT_FORCEIMMEDIATE, so we stop
+    // retrying it every frame.
+    bool     force_immediate_unsupported_ = false;
 
     StereoHandle stereo_handle_         = nullptr;
     bool         stereo_activated_      = false;

@@ -325,6 +325,17 @@ HRESULT DX11Backend::Present() {
     });
 }
 
+HANDLE DX11Backend::GetPresentCompletedEvent() const {
+    return async_.PresentDoneEvent();
+}
+
+void DX11Backend::GetPresentStats(PresentStats* out) {
+    if (!out) return;
+    async_.TakeStats(&out->submits_accepted, &out->submits_dropped,
+                     &out->presents_done, &out->present_ms_avg,
+                     &out->present_ms_max);
+}
+
 void DX11Backend::SetVisible(bool visible) {
     if (!visible) {
         // Hide = the window thread will SW_MINIMIZE the FSE popup within

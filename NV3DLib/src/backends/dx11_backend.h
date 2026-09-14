@@ -40,6 +40,8 @@ public:
     HWND    GetWindowHandle() const override;
     void    NotifyDeviceLost() override;
     void    Delete() override;
+    HANDLE  GetPresentCompletedEvent() const override;
+    void    GetPresentStats(PresentStats* out) override;
 
 private:
     bool EnsureSharedImport(ID3D11Texture2D* sbs);
