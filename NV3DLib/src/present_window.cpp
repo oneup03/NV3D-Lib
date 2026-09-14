@@ -321,9 +321,13 @@ void PresentWindow::WindowThreadLoop() {
     //
     // VRto3D's pattern tracks `was_host_focused` explicitly so ShowWindow
     // fires only on real transitions, not on each tick. We skip VRto3D's
-    // SetWindowPos(HWND_TOPMOST) reassertion and ForceForeground watcher
-    // because WS_EX_TRANSPARENT means our popup never gets activation and
-    // forcing foreground would steal input from the host's game window.
+    // ForceForeground watcher — forcing foreground would steal input from the
+    // host's game window, and the host (which knows the real game PID) owns
+    // that policy. We DO keep its periodic SetWindowPos(HWND_TOPMOST)
+    // reassertion: WS_EX_TRANSPARENT keeps us from being activated, but it
+    // does nothing for Z-order, so a game entering exclusive fullscreen or
+    // any other topmost window can still push us down the stack. See the
+    // steady-state branch of the tracked-pid loop below.
     //
     // ShowWindow + message dispatch are SEH-wrapped: D3D9Ex's internal
     // hook procedures can fault inside DispatchMessage's WndProc path or
@@ -418,6 +422,27 @@ void PresentWindow::WindowThreadLoop() {
                 // Steady-state visible. Keep suppress_minimize_ pinned so
                 // stray deactivation messages don't push the FSE off-screen.
                 suppress_minimize_.store(true, std::memory_order_relaxed);
+
+                // Reassert the TOPMOST stack slot every ~500 ms (10 x 50 ms),
+                // matching the contract InitParams::tracked_game_pid documents.
+                // Z-order drifts on its own: a game entering exclusive
+                // fullscreen, another WS_EX_TOPMOST window activating, or the
+                // driver's ~20-30s stereo revalidation can all land above us.
+                // Because the WndProc swallows WM_ACTIVATE / WM_NCACTIVATE /
+                // WM_KILLFOCUS / SIZE_MINIMIZED while suppress_minimize_ is
+                // set, nothing ever observes the demotion — the popup stays
+                // full-size and keeps presenting BEHIND the game. Ported back
+                // from the pre-NV3D-Lib VRto3D presenter, which gated this on
+                // its is_fse_ flag; the gate is cfg_.on_top instead, since the
+                // windowed fallback is equally WS_EX_TOPMOST when on_top is
+                // set. SWP_NOACTIVATE only, and never ForceForeground from
+                // here — AttachThreadInput against the host process wedges the
+                // OS input chain.
+                if (cfg_.on_top && ++reassert_counter >= 10) {
+                    reassert_counter = 0;
+                    SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
+                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
 
             // 50 ms cadence so hotkey toggles feel responsive.

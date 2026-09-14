@@ -397,10 +397,8 @@ bool D3D9Presenter::BuildD3D9Stack() {
             NV3D_LOG_ERROR(L"CreateDeviceEx WINDOWED also failed hr=0x%08X", hr);
             return false;
         }
-        is_fse_ = false;
         NV3D_LOG_INFO(L"D3D9Presenter: device created (windowed fallback)");
     } else {
-        is_fse_ = true;
         NV3D_LOG_INFO(L"D3D9Presenter: device created (FSE) adapter=%u %ux%u@%uHz",
                        adapter, dm.Width, dm.Height, dm.RefreshRate);
         // Apply click-through styling AFTER FSE is established. VRto3D's

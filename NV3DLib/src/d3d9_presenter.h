@@ -78,7 +78,6 @@ public:
     IDirect3D9Ex*       D3D()    const { return d3d9_.Get(); }
     IDirect3DDevice9Ex* Device() const { return device9_.Get(); }
     StereoHandle        StereoHandleOpaque() const { return stereo_handle_; }
-    bool                IsFSE()  const { return is_fse_; }
 
 private:
     bool BuildD3D9Stack();
@@ -110,7 +109,6 @@ private:
 
     uint32_t monitor_w_ = 0;
     uint32_t monitor_h_ = 0;
-    bool     is_fse_    = false;
 
     StereoHandle stereo_handle_         = nullptr;
     bool         stereo_activated_      = false;
