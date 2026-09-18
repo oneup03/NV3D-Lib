@@ -388,6 +388,65 @@ extern "C" HRESULT CreateInterfaceVulkan(NV3DVkInstance instance,
 #endif
 
 // -----------------------------------------------------------------------------
+// Driver profile (DRS) — Fast Sync
+// -----------------------------------------------------------------------------
+// Independent of any interface: callable with none in existence, which is what
+// a host needs in order to REMOVE the profile after the user switches to an
+// output path that does not want it.
+enum class FastSyncResult : int {
+    Applied,        // profile written — see the "next launch" note below
+    AlreadyActive,  // the wanted value was already in place, so it is live now
+    Removed,        // our profile existed and is gone
+    NotPresent,     // nothing of ours to remove
+    Unavailable,    // no NVAPI (non-NVIDIA system, or nvapi64.dll missing)
+    Conflict,       // another driver profile already claims the executable
+    Failed,         // an NVAPI call failed; see the log
+};
+
+// Enable or remove NVIDIA Fast Sync ("Vertical Sync = Fast", DRS
+// VSYNCMODE_VIRTUAL) for one executable, via a driver profile the library owns
+// outright. Pass null for exe_name to target the calling process's own image.
+//
+// Why a host would want this: Fast Sync is the DRIVER doing what a compositor
+// would otherwise do — show the newest completed frame at each vblank, with no
+// tearing and no vsync-blocking of the application. It is therefore the
+// counterpart to PresentInterval::VsyncOff, which stops the swap chain from
+// throttling itself; Fast Sync only engages for applications that are not
+// already vsync-limited, so neither half achieves much alone. VsyncOff without
+// Fast Sync tears — and on a frame-sequential 3D Vision panel a tear splits two
+// stereo PAIRS across the screen, not two frames.
+//
+// This matters most for the fullscreen-exclusive present path this library
+// drives, because FSE bypasses DWM and leaves nothing else to do that job. A
+// host presenting through a DWM-composited windowed flip-model swap chain
+// already has the equivalent behaviour from DWM and gains nothing here.
+//
+// PERSISTENT SYSTEM STATE, deliberately. The driver samples a profile when a
+// process/device initializes, so a profile written during a session most likely
+// does not apply until that executable next starts. Leaving it in place across
+// exit is what makes it effective on the run that needs it. The return value
+// distinguishes the two cases: AlreadyActive means the value was in place
+// before this call and so is live in the current process; Applied means it was
+// just written and most likely is not.
+//
+// Safety rule: this only ever creates, edits, or deletes the library's own
+// profile. DRS lets an application belong to exactly one profile, and NVIDIA
+// ships predefined profiles covering many executables — if anything else
+// already claims the target, the call logs which profile owns it, changes
+// nothing, and returns Conflict. Driver settings the user or NVIDIA own are
+// never silently overwritten, so there is also nothing to "restore" later.
+//
+// Does NOT touch InitParams::present_interval: coupling a device-creation
+// parameter to persistent machine state would hide one behind the other. A host
+// that wants unthrottled presents asks for both, explicitly.
+//
+// Safe on non-NVIDIA systems and when nvapi64.dll is absent: NvAPI's static
+// import lib loads the DLL itself and NvAPI_Initialize just reports
+// NVAPI_LIBRARY_NOT_FOUND (an SEH filter covers the delay-imported case too).
+// Returns Unavailable and logs.
+extern "C" FastSyncResult SetFastSyncProfile(bool enable, const wchar_t* exe_name);
+
+// -----------------------------------------------------------------------------
 // Logging hook (optional)
 // -----------------------------------------------------------------------------
 // All backends route diagnostic messages through a single sink. By default

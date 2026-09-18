@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug-MT|Win32"><Configuration>Debug-MT</Configuration><Platform>Win32</Platform></ProjectConfiguration>
@@ -99,6 +99,7 @@
     <ClInclude Include="src\log.h" />
     <ClInclude Include="src\present_window.h" />
     <ClInclude Include="src\d3d9_presenter.h" />
+    <ClInclude Include="src\drs_profile.h" />
     <ClInclude Include="src\lightboost.h" />
     <ClInclude Include="src\nvtimings_embedded.h" />
     <ClInclude Include="src\nv_3dvision_suppressor.h" />
@@ -112,6 +113,7 @@
     <ClCompile Include="src\log.cpp" />
     <ClCompile Include="src\present_window.cpp" />
     <ClCompile Include="src\d3d9_presenter.cpp" />
+    <ClCompile Include="src\drs_profile.cpp" />
     <ClCompile Include="src\lightboost.cpp" />
     <ClCompile Include="src\nv_3dvision_suppressor.cpp" />
     <ClCompile Include="src\backends\dx11_backend.cpp" />
