@@ -153,6 +153,10 @@ struct InitParams {
     // goes mono" rather than an error. Off by default; if CreateDeviceEx
     // refuses FLIPEX the library falls back to DISCARD on its own and logs.
     bool use_flipex = false;
+
+    //Receive external LUID
+    bool has_external_luid = false;
+    LUID external_luid{};
 };
 
 // Present-path telemetry, for hosts that want to verify their own frame
